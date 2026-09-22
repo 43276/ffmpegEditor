@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 
 OUTPUT_SUFFIX = "_output"
@@ -72,6 +73,70 @@ class Batch:
     output_dir: Path
     files: list[Path]
     base_name: str | None = None
+
+
+def BuildBatchesForInputs(
+    input_paths: list[str | Path],
+    include_output_dirs: bool = False,
+    output_root: str | Path | None = None,
+    multi_file_output_name: str | None = None,
+) -> list[Batch]:
+    """把一组同类输入统一解析为批次。
+
+    输入只能是文件或文件夹中的一种。多个文件必须位于同一层级，
+    并作为一个批次处理；多个文件夹则各自按 A/B/C 规则处理。
+    """
+    paths = [Path(path) for path in input_paths]
+    if not paths:
+        raise InputError("请先选择输入文件或文件夹")
+    missing = next((path for path in paths if not path.exists()), None)
+    if missing is not None:
+        raise InputError(f"路径不存在：{missing}")
+
+    file_flags = [path.is_file() for path in paths]
+    dir_flags = [path.is_dir() for path in paths]
+    if not all(file_flags) and not all(dir_flags):
+        raise InputError("不能同时选择文件和文件夹")
+
+    if all(file_flags):
+        if any(not IsPictureFile(path) for path in paths):
+            invalid = next(path for path in paths if not IsPictureFile(path))
+            raise InputError(f"不支持的文件类型：{invalid.name}")
+        parents = {path.resolve().parent for path in paths}
+        if len(parents) != 1:
+            raise InputError("多选文件必须位于同一个文件夹内")
+
+        parent = paths[0].parent
+        root = Path(output_root) if output_root is not None else parent
+        if root.exists() and not root.is_dir():
+            raise InputError(f"输出路径不是文件夹：{root}")
+        output_name = multi_file_output_name or "<任务开始时间>"
+        return [
+            Batch(
+                folder=parent,
+                output_dir=root / output_name,
+                files=sorted(paths, key=lambda path: path.name.lower()),
+                base_name=output_name,
+            )
+        ]
+
+    if len(paths) > 1:
+        parents = {path.resolve().parent for path in paths}
+        if len(parents) != 1:
+            raise InputError("多选文件夹必须位于同一个上级文件夹内")
+
+    batches: list[Batch] = []
+    for path in paths:
+        batches.extend(BuildBatches(path, include_output_dirs=include_output_dirs))
+    if output_root is not None:
+        batches = RelocateBatchOutputs(batches, output_root)
+    return batches
+
+
+def MakeTaskOutputName(started_at: datetime | None = None) -> str:
+    """生成多文件任务使用的时间目录名。"""
+    moment = started_at or datetime.now()
+    return moment.strftime("%Y-%m-%d_%H-%M-%S")
 
 
 def BuildBatches(

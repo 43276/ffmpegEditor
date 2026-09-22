@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import html
+import json
 import os
 import subprocess
 import sys
@@ -16,11 +17,14 @@ from PyQt6.QtCore import QSettings, Qt, QThread, pyqtSignal
 from PyQt6.QtGui import QTextCursor
 from PyQt6.QtWidgets import (
     QButtonGroup,
+    QAbstractItemView,
     QFileDialog,
     QGridLayout,
     QHBoxLayout,
     QVBoxLayout,
     QWidget,
+    QListView,
+    QTreeView,
 )
 
 from qfluentwidgets import (
@@ -54,13 +58,13 @@ from app.Converter import (
     ProbeFfmpeg,
 )
 from app.Core import (
-    BuildBatches,
+    BuildBatchesForInputs,
     ConvertOptions,
     InputError,
     IsLosslessExtension,
-    RelocateBatchOutputs,
     SummarizeBatches,
     TARGET_FORMAT_OPTIONS,
+    MakeTaskOutputName,
 )
 from ui.Worker import LOG_ERROR, LOG_INFO, LOG_OK, LOG_WARN, ConvertWorker
 
@@ -109,8 +113,13 @@ class _MainUiMixin:
         self._planned_total = 0
         self._probe_thread: _ProbeThread | None = None
         self._pending_probe_path: str | None = None
+        self._input_paths: list[Path] = []
         self._preview_batches = None
         self._last_output_dirs: list[str] = []
+        self._error_logs: list[str] = []
+        self._skipped_logs: list[str] = []
+        self._live_statistics = {"total": 0, "ok": 0, "failed": 0, "skipped": 0}
+        self._closing = False
 
         self._BuildScrollContent()
         self._BuildInputCard()
@@ -161,7 +170,7 @@ class _MainUiMixin:
         return card, body_layout
 
     def _BuildInputCard(self) -> None:
-        card, layout = self._MakeCard("输入（单个文件或文件夹）")
+        card, layout = self._MakeCard("输入（文件或文件夹，可多选同类项目）")
         self.content_layout.addWidget(card)
 
         # 路径行
@@ -317,10 +326,14 @@ class _MainUiMixin:
         self.end_button = PushButton("结束", card)
         self.end_button.setToolTip("处理完当前正在处理的文件夹后停止，不再开始新的文件夹")
         self.open_folder_button = PushButton("打开输出目录", card)
+        self.export_error_button = PushButton("导出错误日志", card)
+        self.export_skipped_button = PushButton("导出跳过日志", card)
         button_row.addWidget(self.start_button)
         button_row.addWidget(self.cancel_button)
         button_row.addWidget(self.end_button)
         button_row.addWidget(self.open_folder_button)
+        button_row.addWidget(self.export_error_button)
+        button_row.addWidget(self.export_skipped_button)
         button_row.addStretch(1)
         layout.addLayout(button_row)
 
@@ -348,9 +361,12 @@ class _MainUiMixin:
         self.content_layout.addWidget(card)
 
         top_row = QHBoxLayout()
+        self.log_statistics_label = StrongBodyLabel("总数：0    成功：0    失败：0    跳过：0", card)
         top_hint = CaptionLabel("转换过程与 ffmpeg 输出", card)
         clear_button = PushButton("清空", card)
         clear_button.setFixedWidth(72)
+        top_row.addWidget(self.log_statistics_label)
+        top_row.addSpacing(16)
         top_row.addWidget(top_hint)
         top_row.addStretch(1)
         top_row.addWidget(clear_button)
@@ -362,6 +378,7 @@ class _MainUiMixin:
         layout.addWidget(self.log_browser, 1)
 
         self.clear_log_button = clear_button
+        self._UpdateLogExportButtons()
 
     def _ConnectSignals(self) -> None:
         self.browse_file_button.clicked.connect(self._OnBrowseFile)
@@ -369,6 +386,7 @@ class _MainUiMixin:
         self.browse_ffmpeg_button.clicked.connect(self._OnBrowseFfmpeg)
         self.browse_root_button.clicked.connect(self._OnBrowseOutputRoot)
         self.path_line.editingFinished.connect(self._OnPathEdited)
+        self.path_line.textEdited.connect(self._OnPathTextEdited)
         self.ffmpeg_line.editingFinished.connect(self._ProbeCurrentFfmpeg)
         self.output_root_line.editingFinished.connect(self._RefreshPreview)
         self.auto_radio.toggled.connect(lambda _checked: self._OnOutputModeChanged())
@@ -379,6 +397,8 @@ class _MainUiMixin:
         self.cancel_button.clicked.connect(self._OnCancelClicked)
         self.end_button.clicked.connect(self._OnEndClicked)
         self.open_folder_button.clicked.connect(self._OnOpenFolder)
+        self.export_error_button.clicked.connect(self._ExportErrorLog)
+        self.export_skipped_button.clicked.connect(self._ExportSkippedLog)
         self.clear_log_button.clicked.connect(self.log_browser.clear)
         self.include_output_switch.checkedChanged.connect(lambda _checked: self._RefreshPreview())
 
@@ -391,54 +411,123 @@ class _MainUiMixin:
         urls = event.mimeData().urls()
         if not urls:
             return
-        local_path = urls[0].toLocalFile()
-        if local_path:
-            self._SetInputPath(local_path)
+        paths = [Path(url.toLocalFile()) for url in urls if url.isLocalFile()]
+        if paths:
+            self._SetInputPaths(paths)
         event.acceptProposedAction()
 
     # ---- 输入路径 -----------------------------------------------------
     def _OnBrowseFile(self) -> None:
-        file_path, _filter = QFileDialog.getOpenFileName(
+        file_paths, _filter = QFileDialog.getOpenFileNames(
             self,
             "选择图片文件",
             self.path_line.text().strip() or "",
             "图片文件 (*.jpg *.jpeg *.png *.webp *.gif *.avif *.bmp *.tif *.tiff);;所有文件 (*.*)",
         )
-        if file_path:
-            self._SetInputPath(file_path)
+        if file_paths:
+            self._SetInputPaths([Path(path) for path in file_paths])
 
     def _OnBrowseDir(self) -> None:
-        directory = QFileDialog.getExistingDirectory(
-            self, "选择文件夹", self.path_line.text().strip() or ""
-        )
-        if directory:
-            self._SetInputPath(directory)
+        dialog = QFileDialog(self, "选择文件夹", self.path_line.text().strip() or "")
+        dialog.setFileMode(QFileDialog.FileMode.Directory)
+        dialog.setOption(QFileDialog.Option.ShowDirsOnly, True)
+        dialog.setOption(QFileDialog.Option.DontUseNativeDialog, True)
+        for view in dialog.findChildren((QListView, QTreeView)):
+            view.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        if dialog.exec():
+            self._SetInputPaths([Path(path) for path in dialog.selectedFiles()])
 
     def _SetInputPath(self, path_text: str) -> None:
-        self.path_line.setText(path_text)
+        self._SetInputPaths([Path(path_text)])
+
+    def _SetInputPaths(self, paths: list[Path]) -> None:
+        """设置输入选择，并拒绝文件/文件夹混选及跨目录多文件。"""
+        unique_paths: list[Path] = []
+        seen: set[str] = set()
+        for path in paths:
+            key = str(path.resolve()).lower()
+            if key not in seen:
+                seen.add(key)
+                unique_paths.append(path)
+        if not unique_paths:
+            self._input_paths = []
+            self.path_line.setReadOnly(False)
+            self.path_line.setClearButtonEnabled(True)
+            self.path_line.clear()
+            self._RefreshPreview()
+            return
+
+        existing_files = [path for path in unique_paths if path.is_file()]
+        existing_dirs = [path for path in unique_paths if path.is_dir()]
+        if existing_files and existing_dirs:
+            self._ShowInfoBar("选择无效", "不能同时选择文件和文件夹", error=True)
+            return
+        if len(existing_files) > 1:
+            parents = {path.resolve().parent for path in existing_files}
+            if len(parents) != 1:
+                self._ShowInfoBar("选择无效", "多选文件必须位于同一个文件夹内", error=True)
+                return
+        if len(existing_dirs) > 1:
+            parents = {path.resolve().parent for path in existing_dirs}
+            if len(parents) != 1:
+                self._ShowInfoBar("选择无效", "多选文件夹必须位于同一个上级文件夹内", error=True)
+                return
+
+        self._input_paths = unique_paths
+        self.path_line.setReadOnly(len(unique_paths) > 1)
+        self.path_line.setClearButtonEnabled(len(unique_paths) == 1)
+        if len(unique_paths) == 1:
+            self.path_line.setText(str(unique_paths[0]))
+        elif all(path.is_file() for path in unique_paths):
+            self.path_line.setText(
+                f"已选择 {len(unique_paths)} 个文件：{unique_paths[0].parent}"
+            )
+        else:
+            self.path_line.setText(f"已选择 {len(unique_paths)} 个文件夹")
         self._RefreshPreview()
         self._UpdateStartState()
 
     def _OnPathEdited(self) -> None:
+        if self.path_line.isReadOnly():
+            return
+        text = self.path_line.text().strip()
+        if len(self._input_paths) != 1 or not self._input_paths or str(self._input_paths[0]) != text:
+            self._input_paths = [Path(text)] if text else []
         self._RefreshPreview()
         self._UpdateStartState()
 
+    def _OnPathTextEdited(self, text: str) -> None:
+        if not self.path_line.isReadOnly():
+            self._input_paths = [Path(text.strip())] if text.strip() else []
+
+    def _CurrentInputPaths(self) -> list[Path]:
+        if self._input_paths:
+            return list(self._input_paths)
+        text = self.path_line.text().strip()
+        return [Path(text)] if text else []
+
+    def _BuildCurrentBatches(self, task_output_name: str | None = None):
+        paths = self._CurrentInputPaths()
+        output_root = self.output_root_line.text().strip() if self.custom_radio.isChecked() else None
+        return BuildBatchesForInputs(
+            paths,
+            include_output_dirs=self.include_output_switch.isChecked(),
+            output_root=output_root,
+            multi_file_output_name=task_output_name,
+        )
+
     def _RefreshPreview(self) -> None:
-        path_text = self.path_line.text().strip()
-        if not path_text:
+        if not self._CurrentInputPaths():
             self.preview_label.setText("")
             self._preview_batches = None
             return
         try:
-            batches = BuildBatches(path_text, include_output_dirs=self.include_output_switch.isChecked())
-            if self.custom_radio.isChecked():
-                output_root = self.output_root_line.text().strip()
-                if not output_root:
-                    self._preview_batches = None
-                    self.preview_label.setText("⚠ 已选择“指定输出目录”，请先填写输出目录路径")
-                    self._UpdateStartState()
-                    return
-                batches = RelocateBatchOutputs(batches, output_root)
+            if self.custom_radio.isChecked() and not self.output_root_line.text().strip():
+                self._preview_batches = None
+                self.preview_label.setText("⚠ 已选择“指定输出目录”，请先填写输出目录路径")
+                self._UpdateStartState()
+                return
+            batches = self._BuildCurrentBatches()
             self._preview_batches = batches
             self.preview_label.setText(SummarizeBatches(batches))
         except InputError as exc:
@@ -570,8 +659,8 @@ class _MainUiMixin:
 
     # ---- 任务执行 -----------------------------------------------------
     def _OnStartClicked(self) -> None:
-        path_text = self.path_line.text().strip()
-        if not path_text:
+        paths = self._CurrentInputPaths()
+        if not paths:
             self._ShowInfoBar("无法开始", "请先选择输入文件或文件夹", error=True)
             return
         if self._caps is None:
@@ -579,13 +668,11 @@ class _MainUiMixin:
             return
 
         try:
-            batches = BuildBatches(path_text, include_output_dirs=self.include_output_switch.isChecked())
-            if self.custom_radio.isChecked():
-                output_root = self.output_root_line.text().strip()
-                if not output_root:
-                    self._ShowInfoBar("无法开始", "请先指定输出目录", error=True)
-                    return
-                batches = RelocateBatchOutputs(batches, output_root)
+            if self.custom_radio.isChecked() and not self.output_root_line.text().strip():
+                self._ShowInfoBar("无法开始", "请先指定输出目录", error=True)
+                return
+            task_output_name = MakeTaskOutputName() if len(paths) > 1 and all(path.is_file() for path in paths) else None
+            batches = self._BuildCurrentBatches(task_output_name=task_output_name)
         except InputError as exc:
             self._ShowInfoBar("无法开始", str(exc), error=True)
             return
@@ -601,10 +688,13 @@ class _MainUiMixin:
         )
 
         self.log_browser.clear()
+        self._error_logs = []
+        self._skipped_logs = []
         self._last_output_dirs = []
         self.open_folder_button.setEnabled(False)
 
         total = sum(len(batch.files) for batch in batches)
+        self._SetStatistics(total=total, ok=0, failed=0, skipped=0)
         self._planned_total = total
         self._worker_summaries = {}
         self._thread_progress = {}
@@ -615,8 +705,10 @@ class _MainUiMixin:
         worker = ConvertWorker(1, batches, options, self._caps, self)
         worker.logMessage.connect(self._OnWorkerLog)
         worker.progressChanged.connect(self._OnWorkerProgress)
+        worker.statisticsChanged.connect(self._OnWorkerStatistics)
         worker.taskFinished.connect(self._OnWorkerTaskFinished)
         worker.finished.connect(lambda w=worker: self._OnWorkerThreadFinished(w))
+        worker.finished.connect(worker.deleteLater)
         self._workers = [worker]
 
         self._AppendLog(
@@ -639,6 +731,17 @@ class _MainUiMixin:
         self.progress_bar.setValue(min(sum_done, self._planned_total))
         self.status_label.setText(f"进度 {sum_done}/{self._planned_total}")
 
+    def _OnWorkerStatistics(
+        self,
+        _thread_id: int,
+        total: int,
+        ok: int,
+        failed: int,
+        skipped: int,
+        _done: int,
+    ) -> None:
+        self._SetStatistics(total=total, ok=ok, failed=failed, skipped=skipped)
+
     def _OnWorkerTaskFinished(self, thread_id: int, summary: dict) -> None:
         """收集各线程的汇总；全部线程结束后统一收尾。"""
         self._worker_summaries[thread_id] = summary
@@ -654,6 +757,8 @@ class _MainUiMixin:
             "cancelled": False,
             "early_stopped": False,
             "output_dirs": [],
+            "error_logs": [],
+            "skipped_logs": [],
         }
         seen_dirs: set[str] = set()
         for summary in self._worker_summaries.values():
@@ -665,6 +770,8 @@ class _MainUiMixin:
             merged["early_stopped"] = (
                 merged["early_stopped"] or summary["early_stopped"]
             )
+            merged["error_logs"].extend(summary.get("error_logs", []))
+            merged["skipped_logs"].extend(summary.get("skipped_logs", []))
             for directory in summary["output_dirs"]:
                 if directory not in seen_dirs:
                     seen_dirs.add(directory)
@@ -693,6 +800,15 @@ class _MainUiMixin:
                 f"成功 {summary['ok']} 个文件，跳过 {summary['skipped']}",
             )
         self._last_output_dirs = summary["output_dirs"]
+        self._error_logs = summary.get("error_logs", [])
+        self._skipped_logs = summary.get("skipped_logs", [])
+        self._SetStatistics(
+            total=summary["total"],
+            ok=summary["ok"],
+            failed=summary["failed"],
+            skipped=summary["skipped"],
+        )
+        self._UpdateLogExportButtons()
 
         # 任务真正全部结束后（取消 / 提前结束都不算完成）才考虑自动关机
         if (
@@ -755,29 +871,134 @@ class _MainUiMixin:
                 opened += 1
 
     # ---- 状态辅助 -----------------------------------------------------
+    def _SetStatistics(self, total: int, ok: int, failed: int, skipped: int) -> None:
+        self._live_statistics = {
+            "total": total,
+            "ok": ok,
+            "failed": failed,
+            "skipped": skipped,
+        }
+        self.log_statistics_label.setText(
+            f"总数：{total}    成功：{ok}    失败：{failed}    跳过：{skipped}"
+        )
+
+    def _UpdateLogExportButtons(self) -> None:
+        running = bool(self._workers)
+        self.export_error_button.setEnabled(not running and bool(self._error_logs))
+        self.export_skipped_button.setEnabled(not running and bool(self._skipped_logs))
+
+    def _ExportLog(self, title: str, default_name: str, entries: list[str]) -> None:
+        if not entries or self._workers:
+            return
+        file_path, _filter = QFileDialog.getSaveFileName(
+            self, title, default_name, "文本文件 (*.txt);;所有文件 (*.*)"
+        )
+        if not file_path:
+            return
+        try:
+            Path(file_path).write_text("\n".join(entries) + "\n", encoding="utf-8")
+        except OSError as exc:
+            self._ShowInfoBar("导出失败", str(exc), error=True)
+            return
+        self._ShowInfoBar("导出成功", f"日志已保存到：{file_path}")
+
+    def _ExportErrorLog(self) -> None:
+        self._ExportLog("导出错误日志", "error_log.txt", self._error_logs)
+
+    def _ExportSkippedLog(self) -> None:
+        self._ExportLog("导出跳过日志", "skipped_log.txt", self._skipped_logs)
+
     def _UpdateStartState(self) -> None:
-        has_path = bool(self.path_line.text().strip())
+        has_path = bool(self._CurrentInputPaths())
         running = bool(self._workers)
         self.start_button.setEnabled(self._caps is not None and has_path and not running)
         self.cancel_button.setEnabled(running)
         self.end_button.setEnabled(running)
         self.browse_file_button.setEnabled(not running)
         self.browse_dir_button.setEnabled(not running)
+        self._UpdateLogExportButtons()
 
     def _RestoreSettings(self) -> None:
+        geometry = self._settings.value("window/geometry")
+        if geometry:
+            self.restoreGeometry(geometry)
+
         saved_path = self._settings.value("ffmpeg/path", "", type=str)
         if saved_path:
             self.ffmpeg_line.setText(saved_path)
 
+        saved_inputs = self._settings.value("input/paths", "", type=str)
+        if saved_inputs:
+            try:
+                self._SetInputPaths([Path(path) for path in json.loads(saved_inputs)])
+            except (TypeError, ValueError, json.JSONDecodeError):
+                self._input_paths = []
+
+        saved_output_root = self._settings.value("output/root", "", type=str)
+        self.output_root_line.setText(saved_output_root)
+        self.custom_radio.setChecked(
+            self._settings.value("output/custom", False, type=bool)
+        )
+        self.include_output_switch.setChecked(
+            self._settings.value("input/include_output", False, type=bool)
+        )
+        self.overwrite_switch.setChecked(
+            self._settings.value("output/overwrite", True, type=bool)
+        )
+        self.auto_shutdown_switch.setChecked(
+            self._settings.value("task/auto_shutdown", False, type=bool)
+        )
+        self.quality_slider.setValue(
+            self._settings.value("convert/quality", 80, type=int)
+        )
+        self.dimension_spin.setValue(
+            self._settings.value("convert/max_dimension", 0, type=int)
+        )
+        format_index = self._settings.value("convert/format_index", 0, type=int)
+        if 0 <= format_index < self.format_combo.count():
+            self.format_combo.setCurrentIndex(format_index)
+
+    def _SaveSettings(self) -> None:
+        self._settings.setValue("window/geometry", self.saveGeometry())
+        self._settings.setValue(
+            "input/paths", json.dumps([str(path) for path in self._input_paths], ensure_ascii=False)
+        )
+        self._settings.setValue("ffmpeg/path", self.ffmpeg_line.text().strip())
+        self._settings.setValue("output/root", self.output_root_line.text().strip())
+        self._settings.setValue("output/custom", self.custom_radio.isChecked())
+        self._settings.setValue("input/include_output", self.include_output_switch.isChecked())
+        self._settings.setValue("output/overwrite", self.overwrite_switch.isChecked())
+        self._settings.setValue("task/auto_shutdown", self.auto_shutdown_switch.isChecked())
+        self._settings.setValue("convert/quality", self.quality_slider.value())
+        self._settings.setValue("convert/max_dimension", self.dimension_spin.value())
+        self._settings.setValue("convert/format_index", self.format_combo.currentIndex())
+        self._settings.sync()
+
+    def closeEvent(self, event) -> None:  # noqa: N802 —— Qt 事件
+        if self._closing:
+            event.accept()
+            return
+        self._closing = True
+        self._SaveSettings()
+
+        for worker in list(self._workers):
+            worker.RequestCancel()
+        for worker in list(self._workers):
+            worker.wait()
+        if self._probe_thread is not None and self._probe_thread.isRunning():
+            self._probe_thread.wait()
+        self._workers.clear()
+        event.accept()
+
     def _AppendLog(self, level: int, text: str) -> None:
         timestamp = datetime.now().strftime("%H:%M:%S")
-        body = f"[{timestamp}] {_LEVEL_MARKS.get(level, '')}{html.escape(text)}"
+        body = f"[{timestamp}] {_LEVEL_MARKS.get(level, '')}{html.escape(text).replace(chr(10), '<br>')}"
         if level == LOG_INFO:
-            line = f"<p style='margin:0'>{body}</p>"
+            line = f"<div style='margin:0'>{body}</div>"
         else:
             light, dark = _LOG_COLORS[level]
             color = dark if isDarkTheme() else light
-            line = f"<p style='margin:0;color:{color}'>{body}</p>"
+            line = f"<div style='margin:0;color:{color}'>{body}</div>"
         cursor = self.log_browser.textCursor()
         cursor.movePosition(QTextCursor.MoveOperation.End)
         cursor.insertHtml(line)

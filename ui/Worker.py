@@ -28,6 +28,7 @@ class ConvertWorker(QThread):
 
     logMessage = pyqtSignal(int, int, str)
     progressChanged = pyqtSignal(int, int, int, str)
+    statisticsChanged = pyqtSignal(int, int, int, int, int, int)
     taskFinished = pyqtSignal(int, dict)
 
     def __init__(
@@ -71,6 +72,18 @@ class ConvertWorker(QThread):
         cancelled = False
         early_stopped = False
         output_dirs: list[str] = []
+        error_logs: list[str] = []
+        skipped_logs: list[str] = []
+
+        def emit_statistics() -> None:
+            self.statisticsChanged.emit(
+                self._thread_id,
+                total_files,
+                ok_count,
+                failed_count,
+                skipped_count,
+                done,
+            )
 
 
         try:
@@ -106,36 +119,76 @@ class ConvertWorker(QThread):
 
                     if dst_path.exists() and not options.overwrite:
                         skipped_count += 1
-                        self._Log(LOG_WARN, f"已跳过（输出文件已存在）：{dst_name}")
+                        message = f"已跳过（输出文件已存在）：{dst_name}"
+                        skipped_logs.append(message)
+                        self._Log(LOG_WARN, message)
                         self.progressChanged.emit(self._thread_id, done, total_files, dst_name)
+                        emit_statistics()
+                        continue
+
+                    temp_path = dst_path.with_name(f".{dst_path.name}.part{dst_path.suffix}")
+                    try:
+                        temp_path.unlink(missing_ok=True)
+                    except OSError as exc:
+                        failed_count += 1
+                        message = f"{src_file.name}：无法清理临时文件：{exc}"
+                        error_logs.append(message)
+                        self._Log(LOG_ERROR, message)
+                        self.progressChanged.emit(self._thread_id, done, total_files, src_file.name)
+                        emit_statistics()
                         continue
 
                     try:
                         cmd = BuildCommand(options, self._capabilities, src_file)
-                        cmd.append(str(dst_path))  # ffmpeg 输出文件
+                        cmd.append(str(temp_path))  # 先写临时文件，成功后再替换正式文件
                     except ConverterError as exc:
                         failed_count += 1
-                        self._Log(LOG_ERROR, f"{src_file.name}：{exc}")
+                        message = f"{src_file.name}：{exc}"
+                        error_logs.append(message)
+                        self._Log(LOG_ERROR, message)
                         self.progressChanged.emit(self._thread_id, done, total_files, src_file.name)
+                        emit_statistics()
                         continue
 
                     return_code, error_tail, was_cancelled = RunFileProcess(
                         cmd, cancel_check=self._CancelCheck
                     )
                     if was_cancelled:
+                        temp_path.unlink(missing_ok=True)
                         cancelled = True
                         done -= 1
                         break
                     if return_code == 0:
-                        ok_count += 1
-                        self._Log(LOG_OK, f"{src_file.name} → {dst_name} 完成")
+                        try:
+                            if not options.overwrite and dst_path.exists():
+                                temp_path.unlink(missing_ok=True)
+                                skipped_count += 1
+                                message = f"已跳过（输出文件已存在）：{dst_name}"
+                                skipped_logs.append(message)
+                                self._Log(LOG_WARN, message)
+                            else:
+                                temp_path.replace(dst_path)
+                                ok_count += 1
+                                self._Log(LOG_OK, f"{src_file.name} → {dst_name} 完成")
+                        except OSError as exc:
+                            temp_path.unlink(missing_ok=True)
+                            failed_count += 1
+                            message = f"{src_file.name}：无法保存输出文件：{exc}"
+                            error_logs.append(message)
+                            self._Log(LOG_ERROR, message)
                     else:
+                        temp_path.unlink(missing_ok=True)
                         failed_count += 1
                         detail = error_tail or "ffmpeg 返回未知错误"
-                        self._Log(LOG_ERROR, f"{src_file.name} 转换失败：{detail}")
+                        message = f"{src_file.name} 转换失败：{detail}"
+                        error_logs.append(message)
+                        self._Log(LOG_ERROR, message)
                     self.progressChanged.emit(self._thread_id, done, total_files, src_file.name)
+                    emit_statistics()
         except Exception as exc:  # noqa: BLE001 —— 保证线程异常时也能汇报并结束
-            self._Log(LOG_ERROR, f"线程内部异常：{exc}")
+            message = f"线程内部异常：{exc}"
+            error_logs.append(message)
+            self._Log(LOG_ERROR, message)
 
         if cancelled:
             self._Log(LOG_WARN, "已取消，任务中止")
@@ -151,6 +204,8 @@ class ConvertWorker(QThread):
                 f"任务结束：成功 {ok_count}，失败 {failed_count}，跳过 {skipped_count}",
             )
 
+        emit_statistics()
+
         self.taskFinished.emit(self._thread_id, {
             "total": total_files,
             "ok": ok_count,
@@ -159,4 +214,6 @@ class ConvertWorker(QThread):
             "cancelled": cancelled,
             "early_stopped": early_stopped,
             "output_dirs": output_dirs,
+            "error_logs": error_logs,
+            "skipped_logs": skipped_logs,
         })
