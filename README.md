@@ -1,6 +1,6 @@
-# 图片压缩转换工具
+# 图片 / 音频批量处理工具
 
-基于 **FFmpeg** 的图片格式转换 / 压缩桌面工具，图形界面使用 **PyQt6 + PyQt6-Fluent-Widgets**（类 Windows 11 / WinUI 风格），包含任务日志。
+基于 **FFmpeg** 的图片格式转换 / 压缩与音频封面 / 元数据批处理桌面工具，图形界面使用 **PyQt6 + PyQt6-Fluent-Widgets**（类 Windows 11 / WinUI 风格），包含任务日志。左侧边栏分为“图片处理”与“音频处理”两个模块。
 
 ## 运行环境
 
@@ -62,6 +62,42 @@ D:\environment\qt\Scripts\python.exe main.py
   单帧格式时只取第一帧，避免 ffmpeg 因“同名文件写入多帧”而直接失败。
 - 输入规则（A / B / C）、输出位置与命名规则与其它格式完全一致。
 
+### 音频处理 → 专辑批处理
+
+边栏进入“音频处理”后，在主页点击“专辑批处理”入口进入。功能移植自原 `addCover` 脚本：
+
+- 输入一个**专辑根目录**，根目录下每个一级子文件夹视为一张专辑；
+- 在专辑文件夹内**递归**查找音频与图片；
+- 封面图片所在目录必须同时包含 `album.txt` 和 `artist.txt`：
+  - `album.txt` 内容写入音频的 `album`（唱片集）属性；
+  - `artist.txt` 内容写入 `artist`（参与创作的艺术家）属性，多个艺术家用空白分隔，写入时自动转换为分号分隔（如 `Alice Bob` → `Alice;Bob`）；
+  - 音频原有 `title` 与 `#` 属性会被清空；不写入唱片集艺术家属性。
+- 专辑内没有图片、有多张图片，或缺少 / 为空的 `album.txt`、`artist.txt` 时，跳过该专辑；
+- 输出文件夹名为专辑文件夹名，放在每个音频实际所在的文件夹内；输出只产生新文件，**不会改动或删除任何源文件**；
+- 同名输出：开关“覆盖已存在的输出文件”（默认开）。
+
+示例结构：
+
+```text
+D:\Music\Root\A\Images\cover.jpg
+D:\Music\Root\A\Images\album.txt
+D:\Music\Root\A\Images\artist.txt
+D:\Music\Root\A\Disc1\song1.mp3
+D:\Music\Root\A\Disc2\song2.mp3
+```
+
+运行后生成：
+
+```text
+D:\Music\Root\A\Disc1\A\song1.mp3
+D:\Music\Root\A\Disc2\A\song2.mp3
+```
+
+支持的音频扩展名：`.mp3`、`.m4a`、`.mp4`、`.aac`、`.flac`、`.ogg`、`.opus`、`.wav`、`.wma`、`.alac`。
+支持的图片扩展名：`.jpg`、`.jpeg`、`.png`、`.webp`、`.bmp`。
+
+注意：`.wav` 会输出为 `.mp3`（WAV 通常不适合嵌入封面图片），其他格式尽量保持原扩展名并复制原音频流。
+
 ### 界面
 
 - 单页主界面：输入 → 参数 → 开始处理 / 进度 → 处理日志；
@@ -84,11 +120,15 @@ D:\environment\qt\Scripts\python.exe main.py
 compress_images/
 ├── main.py              # 入口
 ├── app/
-│   ├── Core.py          # A/B/C 目录规则、批次构建、参数模型
-│   └── Converter.py     # ffmpeg 探测 / 命令行构建 / 执行
+│   ├── Core.py          # 图片 A/B/C 目录规则、批次构建、参数模型
+│   ├── Converter.py     # ffmpeg 探测 / 命令行构建 / 执行
+│   └── AddCover.py      # 专辑封面 / 元数据批处理核心逻辑
 └── ui/
-    ├── MainWindow.py    # Win11 风格主窗口（含日志）
-    └── Worker.py        # 后台转换线程
+    ├── MainWindow.py    # Win11 风格主窗口（图片处理模块）
+    ├── Worker.py        # 图片后台转换线程
+    ├── AudioPage.py     # 音频处理模块主页
+    ├── AlbumPage.py     # 专辑批处理页面
+    └── AlbumWorker.py   # 专辑批处理后台线程
 ```
 
 ## 备注

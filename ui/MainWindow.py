@@ -66,6 +66,7 @@ from app.Core import (
     TARGET_FORMAT_OPTIONS,
     MakeTaskOutputName,
 )
+from ui.AudioPage import AudioPage
 from ui.Worker import LOG_ERROR, LOG_INFO, LOG_OK, LOG_WARN, ConvertWorker
 
 # 深浅主题下的日志颜色
@@ -131,7 +132,11 @@ class _MainUiMixin:
 
         # 首页导航项
         self.home_interface.setObjectName("homeInterface")
-        self.addSubInterface(self.home_interface, FluentIcon.PHOTO, "图片压缩")
+        self.addSubInterface(self.home_interface, FluentIcon.PHOTO, "图片处理")
+
+        # 音频处理模块
+        self.audio_page = AudioPage(self)
+        self.addSubInterface(self.audio_page, FluentIcon.MUSIC, "音频处理")
 
         # 初始状态
         self._RestoreSettings()
@@ -576,9 +581,11 @@ class _MainUiMixin:
             self._active_ffmpeg_path = None
             self.ffmpeg_status_label.setText(f"✗ {exc}")
             self._caps = None
+            self._SyncFfmpegToAudio()
             self._UpdateStartState()
             return
         self._active_ffmpeg_path = ffmpeg_path
+        self._SyncFfmpegToAudio()
 
         if self._probe_thread is not None and self._probe_thread.isRunning():
             self._pending_probe_path = ffmpeg_path
@@ -589,6 +596,12 @@ class _MainUiMixin:
         self._probe_thread.finished.connect(self._OnProbeThreadFinished)
         self.ffmpeg_status_label.setText("正在检测 ffmpeg…")
         self._probe_thread.start()
+
+    def _SyncFfmpegToAudio(self) -> None:
+        """把当前可用的 ffmpeg 路径同步给音频处理模块。"""
+        audio_page = getattr(self, "audio_page", None)
+        if audio_page is not None:
+            audio_page.SetFfmpegPath(self._active_ffmpeg_path)
 
     def _OnProbeThreadFinished(self) -> None:
         pending = self._pending_probe_path
@@ -985,6 +998,9 @@ class _MainUiMixin:
             worker.RequestCancel()
         for worker in list(self._workers):
             worker.wait()
+        audio_page = getattr(self, "audio_page", None)
+        if audio_page is not None:
+            audio_page.Shutdown()
         if self._probe_thread is not None and self._probe_thread.isRunning():
             self._probe_thread.wait()
         self._workers.clear()
