@@ -1,7 +1,7 @@
-"""音频处理模块主页：与图片处理主页保持一致的卡片式布局。
+"""音频处理模块主页。
 
-当前主页暂无一般操作内容，仅提供已集成的“专辑批处理”功能入口；
-后续新增音频工具时，在“功能入口”卡片中继续添加入口即可。
+主页直接显示“元数据编辑”页面；仅保留“专辑批处理”作为功能入口卡片，
+点击后切换到专辑批处理子页面。
 """
 from __future__ import annotations
 
@@ -12,20 +12,15 @@ from qfluentwidgets import (
     CardWidget,
     FluentIcon,
     IconWidget,
-    ScrollArea,
     StrongBodyLabel,
-    TitleLabel,
 )
 
 from ui.AlbumPage import AlbumPage
+from ui.MetadataPage import MetadataPage
 
 
 class AudioPage(QWidget):
-    """音频处理模块主页。
-
-    内部使用 QStackedWidget 在“主页”和“专辑批处理”之间切换；
-    专辑批处理页面的返回按钮会回到本主页。
-    """
+    """音频处理模块主页：元数据编辑 + 专辑批处理入口。"""
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -43,28 +38,34 @@ class AudioPage(QWidget):
         self._stack.addWidget(self._home_page)
         self._stack.addWidget(self.album_page)
 
-        self.album_page.backRequested.connect(self._ShowHomePage)
+        self.album_page.backRequested.connect(
+            lambda: self._stack.setCurrentWidget(self._home_page)
+        )
         self._stack.setCurrentWidget(self._home_page)
 
-    def _BuildHomePage(self) -> ScrollArea:
-        page = ScrollArea(self)
-        page.setWidgetResizable(True)
-        content = QWidget(page)
-        content.setObjectName("audioHomeContent")
-        page.setWidget(content)
+    def _BuildHomePage(self) -> QWidget:
+        page = QWidget(self)
+        page.setObjectName("audioHomeContent")
 
-        content_layout = QVBoxLayout(content)
-        content_layout.setContentsMargins(30, 22, 30, 26)
-        content_layout.setSpacing(14)
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
 
-        # 与图片处理主页一致的页头
-        content_layout.addWidget(TitleLabel("音频处理", content))
-        content_layout.addWidget(
-            CaptionLabel("音频类批量处理工具（基于 FFmpeg）· 更多功能后续补充", content)
-        )
+        # 功能入口卡片：只保留“专辑批处理”
+        entry_wrap = QWidget(page)
+        entry_wrap_layout = QVBoxLayout(entry_wrap)
+        entry_wrap_layout.setContentsMargins(30, 22, 30, 0)
+        entry_wrap_layout.setSpacing(0)
+        entry_wrap_layout.addWidget(self._BuildAlbumEntryCard(entry_wrap))
+        layout.addWidget(entry_wrap)
 
-        # 功能入口：只保留“专辑批处理”入口卡片
-        entry_card = CardWidget(content)
+        # 元数据编辑直接作为主页内容显示
+        self.metadata_page = MetadataPage(page)
+        layout.addWidget(self.metadata_page, 1)
+        return page
+
+    def _BuildAlbumEntryCard(self, parent: QWidget) -> CardWidget:
+        entry_card = CardWidget(parent)
         entry_card.setClickEnabled(True)
         entry_card.setMinimumHeight(72)
 
@@ -91,17 +92,13 @@ class AudioPage(QWidget):
         arrow_label = CaptionLabel("进入 >", entry_card)
         entry_layout.addWidget(arrow_label)
 
-        content_layout.addWidget(entry_card)
-        content_layout.addStretch(1)
-
         entry_card.clicked.connect(lambda: self._stack.setCurrentWidget(self.album_page))
-        return page
-
-    def _ShowHomePage(self) -> None:
-        self._stack.setCurrentWidget(self._home_page)
+        return entry_card
 
     def SetFfmpegPath(self, path: str | None) -> None:
         self.album_page.SetFfmpegPath(path)
+        self.metadata_page.SetFfmpegPath(path)
 
     def Shutdown(self) -> None:
         self.album_page.Shutdown()
+        self.metadata_page.Shutdown()
