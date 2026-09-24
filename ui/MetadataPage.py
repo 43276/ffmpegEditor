@@ -43,7 +43,6 @@ from qfluentwidgets import (
     ScrollArea,
     SegmentedWidget,
     StrongBodyLabel,
-    SwitchButton,
     TableWidget,
     TextBrowser,
     TitleLabel,
@@ -66,6 +65,7 @@ from app.MetadataEdit import (
     MetadataError,
     TrackEdit,
 )
+from ui.Controls import MakeSwitchButton
 from ui.MetadataWorker import CoverExportWorker, MetadataReadWorker, MetadataWriteWorker
 from ui.Worker import LOG_ERROR, LOG_INFO, LOG_OK, LOG_WARN
 
@@ -653,7 +653,7 @@ class MetadataPage(QWidget):
         self.wav_cover_label = self._MakeFieldLabel("WAV 封面", card)
         grid.addWidget(self.wav_cover_label, 2, 0)
         wav_row = QHBoxLayout()
-        self.wav_cover_switch = SwitchButton("为 wav 添加封面时自动转换为", card)
+        self.wav_cover_switch = MakeSwitchButton("为 wav 添加封面时自动转换为", card)
         self.wav_target_combo = ComboBox(card)
         for item in WAV_AUTO_CONVERT_TARGETS:
             self.wav_target_combo.addItem(item.display_name, userData=item.key)
@@ -695,11 +695,11 @@ class MetadataPage(QWidget):
         # 覆盖与备份
         grid.addWidget(self._MakeFieldLabel("同名输出", card), 5, 0)
         same_row = QHBoxLayout()
-        self.overwrite_switch = SwitchButton("覆盖已存在的输出文件", card)
+        self.overwrite_switch = MakeSwitchButton("覆盖已存在的输出文件", card)
         self.overwrite_switch.setChecked(True)
         same_row.addWidget(self.overwrite_switch)
         same_row.addSpacing(24)
-        self.backup_switch = SwitchButton("覆盖前备份源文件 (.bak)", card)
+        self.backup_switch = MakeSwitchButton("覆盖前备份源文件 (.bak)", card)
         same_row.addWidget(self.backup_switch)
         same_row.addStretch(1)
         grid.addLayout(same_row, 5, 1)

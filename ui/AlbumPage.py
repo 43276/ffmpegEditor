@@ -26,7 +26,6 @@ from qfluentwidgets import (
     PushButton,
     ScrollArea,
     StrongBodyLabel,
-    SwitchButton,
     TextBrowser,
     TitleLabel,
 )
@@ -35,6 +34,7 @@ from qfluentwidgets.common.style_sheet import isDarkTheme
 from app.AddCover import AlbumPlan, BuildAlbumPlan, SummarizeAlbumPlan
 from app.Converter import ConverterError, LocateFfmpeg
 from ui.AlbumWorker import AlbumWorker
+from ui.Controls import MakeSwitchButton
 from ui.Worker import LOG_ERROR, LOG_INFO, LOG_OK, LOG_WARN
 
 # 深浅主题下的日志颜色
@@ -157,7 +157,7 @@ class AlbumPage(QWidget):
         layout.addLayout(grid)
 
         grid.addWidget(self._MakeFieldLabel("同名输出", card), 0, 0)
-        self.overwrite_switch = SwitchButton("覆盖已存在的输出文件", card)
+        self.overwrite_switch = MakeSwitchButton("覆盖已存在的输出文件", card)
         self.overwrite_switch.setChecked(True)
         grid.addWidget(self.overwrite_switch, 0, 1)
 

@@ -44,7 +44,6 @@ from qfluentwidgets import (
     Slider,
     SpinBox,
     StrongBodyLabel,
-    SwitchButton,
     TextBrowser,
     TitleLabel,
 )
@@ -67,6 +66,7 @@ from app.Core import (
     MakeTaskOutputName,
 )
 from ui.AudioPage import AudioPage
+from ui.Controls import MakeSwitchButton
 from ui.Worker import LOG_ERROR, LOG_INFO, LOG_OK, LOG_WARN, ConvertWorker
 
 # 深浅主题下的日志颜色
@@ -195,7 +195,7 @@ class _MainUiMixin:
         layout.addWidget(self.preview_label)
 
         # 重复处理开关：对“自动 *_output”与“指定输出目录”两种模式都生效
-        self.include_output_switch = SwitchButton("重复处理：把已有的 *_output 输出目录也作为输入", card)
+        self.include_output_switch = MakeSwitchButton("重复处理：把已有的 *_output 输出目录也作为输入", card)
         self.include_output_switch.setChecked(False)
         layout.addWidget(self.include_output_switch)
         include_hint = CaptionLabel(
@@ -291,7 +291,7 @@ class _MainUiMixin:
 
         # 覆盖
         grid.addWidget(self._MakeFieldLabel("同名输出", card), row, 0)
-        self.overwrite_switch = SwitchButton("覆盖已存在的输出文件", card)
+        self.overwrite_switch = MakeSwitchButton("覆盖已存在的输出文件", card)
         self.overwrite_switch.setChecked(True)
         grid.addWidget(self.overwrite_switch, row, 1)
         row += 1
@@ -352,7 +352,7 @@ class _MainUiMixin:
 
         # 任务完成后的自动关机选项（默认关闭，避免误触）
         shutdown_row = QHBoxLayout()
-        self.auto_shutdown_switch = SwitchButton("任务完成后自动关机", card)
+        self.auto_shutdown_switch = MakeSwitchButton("任务完成后自动关机", card)
         self.auto_shutdown_switch.setChecked(False)
         shutdown_hint = CaptionLabel("仅 Windows · 全部结束后 60 秒倒计时关机，可在系统提示中取消（shutdown /a）", card)
         shutdown_row.addWidget(self.auto_shutdown_switch)
