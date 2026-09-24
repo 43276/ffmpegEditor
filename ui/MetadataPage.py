@@ -570,7 +570,7 @@ class MetadataPage(QWidget):
         self.content_layout.addWidget(TitleLabel("元数据编辑", content))
         self.content_layout.addWidget(
             CaptionLabel(
-                "基于 ffprobe / ffmpeg · 导入音频后在表格中编辑元数据、封面与格式，确认后写盘",
+                "基于 ffprobe / ffmpeg · 导入音频后在表格中编辑元数据、封面与格式，确认后写入",
                 content,
             )
         )
@@ -718,7 +718,7 @@ class MetadataPage(QWidget):
         self.confirm_button = PrimaryPushButton("确认修改", card)
         self.cancel_button = PushButton("取消", card)
         self.open_output_button = PushButton("打开输出目录", card)
-        self.open_output_button.setToolTip("打开本次写盘产出文件所在的目录")
+        self.open_output_button.setToolTip("打开本次写入产出文件所在的目录")
         top_row.addWidget(self.reset_button)
         top_row.addWidget(self.confirm_button)
         top_row.addWidget(self.cancel_button)
@@ -1260,7 +1260,7 @@ class MetadataPage(QWidget):
         if action == "set" and any(
             row.original_ext == ".wav" for row in rows if row.cover_action == "set"
         ) and self.wav_cover_switch.isChecked():
-            self._AppendLog(LOG_INFO, "wav 加封面：已自动设置转换格式（写盘时转换）")
+            self._AppendLog(LOG_INFO, "wav 加封面：已自动设置转换格式（写入时转换）")
 
     # ---- 确认写入 -----------------------------------------------------
     def _OnConfirmClicked(self) -> None:
@@ -1316,7 +1316,7 @@ class MetadataPage(QWidget):
 
     def _OnWorkerProgress(self, _thread_id: int, done: int, _total: int, _name: str) -> None:
         self.progress_bar.setValue(done)
-        self.status_label.setText(f"正在写盘 {done}/{self._planned_total}")
+        self.status_label.setText(f"正在写入 {done}/{self._planned_total}")
 
     def _OnWorkerStatistics(
         self, _thread_id: int, total: int, ok: int, failed: int, skipped: int, _done: int
@@ -1386,7 +1386,7 @@ class MetadataPage(QWidget):
             self._worker_summaries = {}
             self._thread_progress = {}
             self._UpdateControls()
-            # 写盘后重新导入，让表格回到磁盘上的真实状态
+            # 写入后重新导入，让表格回到磁盘上的真实状态
             if not self._closing and self._rows:
                 self._StartImport([row.path for row in self._rows])
 
