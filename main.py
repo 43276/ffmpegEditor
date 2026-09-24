@@ -1,4 +1,4 @@
-"""图片压缩转换工具 —— 程序入口。
+"""ffpmeg工具 —— 程序入口。
 
 运行：python main.py
 """
@@ -12,8 +12,8 @@ def main() -> int:
     from qfluentwidgets import Theme, setTheme
 
     app = QApplication(sys.argv)
-    app.setApplicationName("图片压缩转换工具")
-    app.setOrganizationName("CompressImages")
+    app.setApplicationName("ffmpeg工具")
+    app.setOrganizationName("ffmpegEditor")
     setTheme(Theme.AUTO)
 
     # MSFluentWindow（Win11 Mica）构造失败时回退到 FluentWindow

@@ -100,7 +100,7 @@ class _MainUiMixin:
 
     # ---- 初始化 -------------------------------------------------------
     def _SetupUi(self) -> None:
-        self.setWindowTitle("图片压缩转换工具")
+        self.setWindowTitle("ffmpeg工具")
         self.resize(1100, 800)
         self.setMinimumSize(900, 650)
         self.setWindowIcon(toQIcon(FluentIcon.PHOTO))
