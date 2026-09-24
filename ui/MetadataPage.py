@@ -24,7 +24,6 @@ from PyQt6.QtWidgets import (
     QHBoxLayout,
     QHeaderView,
     QLabel,
-    QLineEdit,
     QVBoxLayout,
     QWidget,
 )
@@ -32,6 +31,7 @@ from PyQt6.QtWidgets import (
 from qfluentwidgets import (
     Action,
     CaptionLabel,
+    CheckableMenu,
     ComboBox,
     DropDownPushButton,
     HeaderCardWidget,
@@ -40,7 +40,6 @@ from qfluentwidgets import (
     PrimaryPushButton,
     ProgressBar,
     PushButton,
-    RoundMenu,
     ScrollArea,
     SegmentedWidget,
     StrongBodyLabel,
@@ -171,6 +170,17 @@ class _MarqueeLabel(QWidget):
                 self._text,
             )
         painter.restore()
+
+
+class _CellEditor(QWidget):
+    """文本单元格容器：把输入框居中并留边，使其比表格格子小。"""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.line_edit = LineEdit(self)
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(12, 5, 12, 5)
+        layout.addWidget(self.line_edit)
 
 
 class _TextDialog(QDialog):
@@ -602,12 +612,7 @@ class MetadataPage(QWidget):
         button_row.addStretch(1)
         layout.addLayout(button_row)
 
-        hint = CaptionLabel(
-            "可一次选择多个音频文件；也可选择一个文件夹（递归收集其中的音频，不能多选文件夹）。"
-            "也可以直接把文件或单个文件夹拖拽到本页。",
-            card,
-        )
-        layout.addWidget(hint)
+        
 
     def _BuildParamsCard(self) -> None:
         card, layout = self._MakeCard("编辑参数")
@@ -621,29 +626,32 @@ class MetadataPage(QWidget):
         # 字段多选下拉
         grid.addWidget(self._MakeFieldLabel("元数据字段", card), 0, 0)
         field_row = QHBoxLayout()
-        self.field_dropdown = DropDownPushButton("选择字段 ▾", card)
+        self.field_dropdown = DropDownPushButton("选择字段", card)
         field_row.addWidget(self.field_dropdown)
+        field_row.addSpacing(12)
         field_row.addWidget(
-            CaptionLabel("勾选后在表格中显示为列；未勾选的字段不会显示、也不会写入", card)
+            CaptionLabel("未勾选的字段不会显示、也不会写入", card)
         )
         field_row.addStretch(1)
         grid.addLayout(field_row, 0, 1)
 
         # 封面缩放等级（仅勾选封面时显示）
-        grid.addWidget(self._MakeFieldLabel("封面缩放", card), 1, 0)
+        self.cover_zoom_label = self._MakeFieldLabel("封面缩放", card)
+        grid.addWidget(self.cover_zoom_label, 1, 0)
         zoom_row = QHBoxLayout()
         self.cover_zoom_seg = SegmentedWidget(card)
         self.cover_zoom_seg.addItem("small", "小")
         self.cover_zoom_seg.addItem("large", "大")
         self.cover_zoom_seg.setCurrentItem("small")
         zoom_row.addWidget(self.cover_zoom_seg)
-        zoom_row.addWidget(CaptionLabel("封面尺寸变化时行高同步适配，字体大小不变", card))
+        zoom_row.addSpacing(12)
         zoom_row.addStretch(1)
         self.cover_zoom_row = zoom_row
         grid.addLayout(zoom_row, 1, 1)
 
         # wav 加封面自动转换
-        grid.addWidget(self._MakeFieldLabel("WAV 封面", card), 2, 0)
+        self.wav_cover_label = self._MakeFieldLabel("WAV 封面", card)
+        grid.addWidget(self.wav_cover_label, 2, 0)
         wav_row = QHBoxLayout()
         self.wav_cover_switch = SwitchButton("为 wav 添加封面时自动转换为", card)
         self.wav_target_combo = ComboBox(card)
@@ -656,25 +664,27 @@ class MetadataPage(QWidget):
         self.wav_row = wav_row
         grid.addLayout(wav_row, 2, 1)
 
-        # 写盘方式
-        grid.addWidget(self._MakeFieldLabel("写盘方式", card), 3, 0)
+        # 修改方式
+        grid.addWidget(self._MakeFieldLabel("修改方式", card), 3, 0)
         mode_row = QHBoxLayout()
         self.write_mode_seg = SegmentedWidget(card)
-        self.write_mode_seg.addItem("inplace", "原地修改")
-        self.write_mode_seg.addItem("output", "输出到新文件")
+        self.write_mode_seg.addItem("inplace", "覆盖")
+        self.write_mode_seg.addItem("output", "另存为")
         self.write_mode_seg.setCurrentItem("inplace")
         mode_row.addWidget(self.write_mode_seg)
+        mode_row.addSpacing(12)
         mode_row.addWidget(
-            CaptionLabel("原地修改直接写回源文件；输出到新文件则源文件不动", card)
+            CaptionLabel(card)
         )
         mode_row.addStretch(1)
         grid.addLayout(mode_row, 3, 1)
 
         # 输出目录（输出模式）
-        grid.addWidget(self._MakeFieldLabel("输出目录", card), 4, 0)
+        self.output_root_label = self._MakeFieldLabel("输出目录", card)
+        grid.addWidget(self.output_root_label, 4, 0)
         output_row = QHBoxLayout()
         self.output_root_line = LineEdit(card)
-        self.output_root_line.setPlaceholderText("输出到新文件时必填")
+        self.output_root_line.setPlaceholderText("另存为时必填")
         self.output_root_line.setClearButtonEnabled(True)
         self.output_root_browse = PushButton("浏览…", card)
         output_row.addWidget(self.output_root_line, 1)
@@ -688,7 +698,8 @@ class MetadataPage(QWidget):
         self.overwrite_switch = SwitchButton("覆盖已存在的输出文件", card)
         self.overwrite_switch.setChecked(True)
         same_row.addWidget(self.overwrite_switch)
-        self.backup_switch = SwitchButton("原地修改前备份源文件 (.bak)", card)
+        same_row.addSpacing(24)
+        self.backup_switch = SwitchButton("覆盖前备份源文件 (.bak)", card)
         same_row.addWidget(self.backup_switch)
         same_row.addStretch(1)
         grid.addLayout(same_row, 5, 1)
@@ -699,7 +710,7 @@ class MetadataPage(QWidget):
         layout.addWidget(self.ffmpeg_status_label)
 
     def _BuildTableCard(self) -> None:
-        card, layout = self._MakeCard("预览与编辑（内存中修改，确认后才写盘）")
+        card, layout = self._MakeCard("预览与编辑")
         self.content_layout.addWidget(card)
 
         top_row = QHBoxLayout()
@@ -731,8 +742,8 @@ class MetadataPage(QWidget):
         layout.addWidget(self.progress_bar)
 
         hint = CaptionLabel(
-            "点击列标题可统一修改该列；点击封面/格式单元格可只修改该行；"
-            "文本单元格直接输入即可。格式列：.ext 表示保持原格式，.ext1->.ext2 码率 表示将转换。",
+            "点击列标题统一修改该列；点击单元格只修改该行；"
+            ".ext1->.ext2 码率 表示将转换。",
             card,
         )
         layout.addWidget(hint)
@@ -765,6 +776,7 @@ class MetadataPage(QWidget):
         self.import_folder_button.clicked.connect(self._OnImportFolder)
         self.field_dropdown.clicked.connect(self._OnFieldMenuClicked)
         self.cover_zoom_seg.currentItemChanged.connect(self._OnCoverZoomChanged)
+        self.wav_cover_switch.checkedChanged.connect(self._OnWavCoverToggled)
         self.write_mode_seg.currentItemChanged.connect(self._OnWriteModeChanged)
         self.output_root_browse.clicked.connect(self._OnBrowseOutputRoot)
         self.reset_button.clicked.connect(self._OnResetClicked)
@@ -1001,13 +1013,15 @@ class MetadataPage(QWidget):
         for item in TEXT_FIELDS:
             if item.key not in self._checked_fields:
                 continue
-            editor = QLineEdit(self.table)
-            editor.setText(row.edited_values.get(item.key, row.original_values.get(item.key, "")))
+            container = _CellEditor(self.table)
+            editor = container.line_edit
+            editor.setText(row.edited_values.get(item.key, ""))
+            editor.setPlaceholderText(row.original_values.get(item.key, ""))
             editor.setToolTip(item.display_name)
             editor.textEdited.connect(
                 lambda value, r=row, key=item.key: self._OnTextEdited(r, key, value)
             )
-            self.table.setCellWidget(row_index, col, editor)
+            self.table.setCellWidget(row_index, col, container)
             col += 1
 
     def _UpdateRowCells(self, row: TrackEdit) -> None:
@@ -1070,7 +1084,7 @@ class MetadataPage(QWidget):
 
     # ---- 字段下拉 -----------------------------------------------------
     def _OnFieldMenuClicked(self) -> None:
-        menu = RoundMenu(parent=self)
+        menu = CheckableMenu(parent=self)
         for item in METADATA_FIELDS:
             label = "封面" if item.kind == "cover" else item.display_name
             action = Action(label, menu)
@@ -1099,13 +1113,16 @@ class MetadataPage(QWidget):
         self._UpdateControls()
         self._RebuildTable()
 
-    # ---- 缩放 / 写盘方式 ---------------------------------------------
+    # ---- 缩放 / 修改方式 ---------------------------------------------
     def _OnCoverZoomChanged(self, key: str) -> None:
         self._cover_zoom = key
         self._ApplyCoverZoom()
 
     def _OnWriteModeChanged(self, key: str) -> None:
         self._write_mode = key
+        self._UpdateControls()
+
+    def _OnWavCoverToggled(self, _checked: bool) -> None:
         self._UpdateControls()
 
     def _OnBrowseOutputRoot(self) -> None:
@@ -1165,10 +1182,10 @@ class MetadataPage(QWidget):
                     if row_index < 0:
                         continue
                     widget = self.table.cellWidget(row_index, col)
-                    if isinstance(widget, QLineEdit):
-                        widget.blockSignals(True)
-                        widget.setText(dialog.value)
-                        widget.blockSignals(False)
+                    if isinstance(widget, _CellEditor):
+                        widget.line_edit.blockSignals(True)
+                        widget.line_edit.setText(dialog.value)
+                        widget.line_edit.blockSignals(False)
             self._UpdateModifiedStatus()
 
     def _OpenFormatDialog(self, scope_row: TrackEdit | None) -> None:
@@ -1265,7 +1282,7 @@ class MetadataPage(QWidget):
         if not in_place:
             text = self.output_root_line.text().strip()
             if not text:
-                self._ShowInfoBar("无法开始", "输出到新文件需要先选择输出目录", error=True)
+                self._ShowInfoBar("无法开始", "另存为需要先选择输出目录", error=True)
                 return
             output_root = text
 
@@ -1461,7 +1478,9 @@ class MetadataPage(QWidget):
         self.field_dropdown.setEnabled(not running)
 
         self._ShowRow(self.cover_zoom_row, has_cover)
+        self.cover_zoom_label.setVisible(has_cover)
         self._ShowRow(self.wav_row, has_cover)
+        self.wav_cover_label.setVisible(has_cover)
         self.cover_zoom_seg.setEnabled(not running)
         self.wav_cover_switch.setEnabled(not running)
         self.wav_target_combo.setEnabled(not running and self.wav_cover_switch.isChecked())
@@ -1469,6 +1488,7 @@ class MetadataPage(QWidget):
         self.write_mode_seg.setEnabled(not running)
         in_place = self._write_mode == "inplace"
         self._ShowRow(self.output_root_row, not in_place)
+        self.output_root_label.setVisible(not in_place)
         self.output_root_line.setEnabled(not running)
         self.output_root_browse.setEnabled(not running)
         self.backup_switch.setVisible(in_place)

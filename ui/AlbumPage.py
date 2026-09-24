@@ -121,13 +121,13 @@ class AlbumPage(QWidget):
         return card, body_layout
 
     def _BuildInputCard(self) -> None:
-        card, layout = self._MakeCard("输入（专辑根目录）")
+        card, layout = self._MakeCard("输入")
         self.content_layout.addWidget(card)
 
         path_row = QHBoxLayout()
         self.root_line = LineEdit(card)
         self.root_line.setClearButtonEnabled(True)
-        self.root_line.setPlaceholderText("选择专辑根目录，或直接拖拽文件夹到这里")
+        self.root_line.setPlaceholderText("选择专辑根目录")
         self.root_line.setMinimumHeight(36)
         browse_button = PushButton("选择文件夹…", card)
         path_row.addWidget(self.root_line, 1)

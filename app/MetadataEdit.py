@@ -222,13 +222,20 @@ def ReadAudioInfo(ffprobe_path: str, audio_path: Path) -> AudioInfo:
 
     has_cover = False
     cover_codec: str | None = None
+    image_codecs = {"mjpeg", "jpeg", "png", "bmp", "webp", "gif", "tiff"}
     for stream in data.get("streams") or []:
         if stream.get("codec_type") != "video":
             continue
+        codec = (stream.get("codec_name") or "").lower()
         if (stream.get("disposition") or {}).get("attached_pic") == 1:
             has_cover = True
             cover_codec = stream.get("codec_name")
             break
+        # 部分文件的封面流没有 attached_pic 标记（或标记缺失），但音频文件里的
+        # 视频流只要是图片编码，就视为内嵌封面。
+        if codec in image_codecs and not has_cover:
+            has_cover = True
+            cover_codec = stream.get("codec_name")
 
     return AudioInfo(audio_path, values, has_cover, cover_codec)
 

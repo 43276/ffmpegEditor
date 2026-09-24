@@ -175,14 +175,14 @@ class _MainUiMixin:
         return card, body_layout
 
     def _BuildInputCard(self) -> None:
-        card, layout = self._MakeCard("输入（文件或文件夹，可多选同类项目）")
+        card, layout = self._MakeCard("输入")
         self.content_layout.addWidget(card)
 
         # 路径行
         path_row = QHBoxLayout()
         self.path_line = LineEdit(card)
         self.path_line.setClearButtonEnabled(True)
-        self.path_line.setPlaceholderText("选择图片文件 / 文件夹，或直接拖拽到这里")
+        self.path_line.setPlaceholderText("选择图片文件 / 文件夹")
         self.path_line.setMinimumHeight(36)
         browse_file_button = PushButton("选择文件…", card)
         browse_dir_button = PushButton("选择文件夹…", card)
