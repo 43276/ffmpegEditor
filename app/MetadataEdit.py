@@ -6,7 +6,7 @@
 - 封面动作：set=替换、remove=移除、None=保持；
 - 原地模式：不转格式时写临时文件后原子替换源文件；转格式且扩展名变化时
   新文件生成在源文件旁并保留源文件；输出模式：全部写入指定输出目录；
-- .wav / .aac / .ogg / .opus 容器不支持内嵌封面，写盘时自动忽略封面并给出警告；
+- .wav / .aac / .ogg / .opus 容器不支持内嵌封面，写入时自动忽略封面并给出警告；
 - 输出的 mp3 统一写 ID3v2.3（与图片模块 / 专辑批处理保持一致）；
 - 输出文件与既有文件重名时自动追加序号，不覆盖已存在的其它文件。
 """
@@ -91,7 +91,7 @@ WAV_AUTO_CONVERT_TARGETS: tuple[AudioFormatOption, ...] = tuple(
     item for item in FORMAT_OPTIONS if item.cover_capable
 )
 
-# 容器不支持内嵌封面的目标扩展名：写盘时自动忽略封面修改并给出警告
+# 容器不支持内嵌封面的目标扩展名：写入时自动忽略封面修改并给出警告
 COVER_UNSUPPORTED_EXTENSIONS: frozenset[str] = frozenset(
     {".wav", ".aac", ".ogg", ".opus"}
 )
@@ -123,7 +123,7 @@ def FormatDisplay(original_ext: str, target_format_key: str | None, bitrate: str
 def IsAudioFile(path: Path) -> bool:
     """是否为可用作输入的音频文件。
 
-    排除隐藏文件与写盘 / 转换残留的临时文件：临时文件名形如
+    排除隐藏文件与写入 / 转换残留的临时文件：临时文件名形如
     `.<名称>.part.<扩展名>`，其后缀仍是音频扩展名，不排除会被当成正常音频导入。
     """
     if not path.is_file() or path.suffix.lower() not in AUDIO_EXTENSIONS:
@@ -337,7 +337,7 @@ def ExtractCoverToFile(
 
 @dataclass
 class TrackEdit:
-    """表格中一行音频的内存态（未确认前不写盘）。"""
+    """表格中一行音频的内存态（未确认前不写入）。"""
 
     path: Path
     original_ext: str = ""
@@ -379,7 +379,7 @@ class TrackEdit:
         return FormatDisplay(self.original_ext, self.target_format_key, self.bitrate)
 
 
-# ---- 写盘命令构建 -----------------------------------------------------
+# ---- 写入命令构建 -----------------------------------------------------
 
 @dataclass
 class OutputPlan:
@@ -425,7 +425,7 @@ def BuildOutputPlan(
     output_root: str | Path | None,
     used_outputs: set[str] | None = None,
 ) -> OutputPlan:
-    """为一行音频构建写盘计划（输出路径、临时路径与 ffmpeg 命令）。
+    """为一行音频构建写入计划（输出路径、临时路径与 ffmpeg 命令）。
 
     used_outputs：同一批任务里已被占用的输出路径（小写字符串），用于避免不同源
     目录下的同名文件在输出模式里相互覆盖。

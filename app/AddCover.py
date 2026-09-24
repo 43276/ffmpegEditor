@@ -1,14 +1,3 @@
-"""专辑封面 / 元数据批处理核心逻辑（移植自原 addCover 脚本）。
-
-规则：
-- 输入一个根目录，根目录下每个一级子文件夹视为一张“专辑”；
-- 在专辑文件夹内递归查找音频和图片；
-- 专辑内没有图片、有多张图片，或封面所在目录缺少 / 为空的
-  album.txt、artist.txt 时，跳过该专辑；
-- 用找到的唯一图片作为封面，写入 album / artist，并清空 title 与 #；
-- 输出到每个音频实际所在目录下的 `<专辑文件夹名>` 子目录；
-- .wav 会转码为 .mp3，其余格式复制原音频流并尽量保持扩展名。
-"""
 from __future__ import annotations
 
 from dataclasses import dataclass

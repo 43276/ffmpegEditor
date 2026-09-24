@@ -154,7 +154,7 @@ class MetadataWriteWorker(QThread):
         self._Log(
             LOG_INFO,
             f"确认修改开始：{total} 个文件，"
-            f"写盘方式 {'原地修改' if self._in_place else '输出到新文件'}",
+            f"写入方式 {'原地修改' if self._in_place else '输出到新文件'}",
         )
 
         used_outputs: set[str] = set()

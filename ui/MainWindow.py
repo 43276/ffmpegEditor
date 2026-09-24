@@ -1,5 +1,4 @@
-"""主窗口：类 Windows 11（WinUI）风格的单页主界面。
-
+"""主窗口
 窗口基类优先 MSFluentWindow（微软商店风格 + Win11 Mica），
 构造失败时由入口回退到 FluentWindow。
 """

@@ -1,4 +1,4 @@
-"""专辑批处理后台线程：在子线程里逐文件调用 ffmpeg，不阻塞界面。"""
+"""专辑批处理后台线程"""
 from __future__ import annotations
 
 from pathlib import Path
