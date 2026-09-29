@@ -174,9 +174,16 @@ def BuildFfmpegCommand(
     ]
 
     if ext == ".wav":
-        command.extend(["-c:a", "libmp3lame", "-q:a", "2", "-id3v2_version", "3"])
+        command.extend([
+            "-c:a", "libmp3lame", "-q:a", "2", "-id3v2_version", "3",
+            "-disposition:v:0", "attached_pic",
+        ])
     elif ext == ".mp3":
-        command.extend(["-c:a", "copy", "-id3v2_version", "3"])
+        # MP3 中的图片流必须标记为 attached_pic，播放器才会将其识别为封面。
+        command.extend([
+            "-c:a", "copy", "-id3v2_version", "3",
+            "-disposition:v:0", "attached_pic",
+        ])
     else:
         command.extend(["-c:a", "copy", "-disposition:v:0", "attached_pic"])
 

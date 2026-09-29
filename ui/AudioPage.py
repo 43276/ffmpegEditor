@@ -48,17 +48,10 @@ class AudioPage(QWidget):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
 
-        # 功能入口卡片：只保留“专辑批处理”
-        entry_wrap = QWidget(page)
-        entry_wrap_layout = QVBoxLayout(entry_wrap)
-        entry_wrap_layout.setContentsMargins(30, 22, 30, 0)
-        entry_wrap_layout.setSpacing(0)
-        entry_wrap_layout.addWidget(self._BuildAlbumEntryCard(entry_wrap))
-        layout.addWidget(entry_wrap)
-
-        # 元数据编辑直接作为主页内容显示
+        # 元数据页拥有整个滚动流；专辑批处理入口附在其最底部，随页面一起滚动。
         self.metadata_page = MetadataPage(page)
         layout.addWidget(self.metadata_page, 1)
+        self.metadata_page.AddBottomWidget(self._BuildAlbumEntryCard(self.metadata_page))
         return page
 
     def _BuildAlbumEntryCard(self, parent: QWidget) -> CardWidget:

@@ -191,7 +191,11 @@ def _RunFfprobe(ffprobe_path: str, audio_path: Path) -> tuple[bool, str, str]:
         str(audio_path),
     ]
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+        # ffprobe 的 JSON 是 UTF-8；Windows 的 text=True 默认会按 GBK 解码，
+        # 遇到含特殊字符的路径或标签会在后台 reader 线程直接抛 UnicodeDecodeError。
+        result = subprocess.run(
+            cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=60
+        )
     except OSError as exc:
         return False, "", f"无法运行 ffprobe：{exc}"
     except subprocess.TimeoutExpired:
@@ -322,7 +326,9 @@ def ExtractCoverToFile(
         str(dest),
     ]
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+        result = subprocess.run(
+            cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=60
+        )
     except OSError as exc:
         return None, f"无法运行 ffmpeg：{exc}"
     except subprocess.TimeoutExpired:

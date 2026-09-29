@@ -6,12 +6,11 @@ import html
 import os
 import tempfile
 import time
-import weakref
 from datetime import datetime
 from pathlib import Path
 
-from PyQt6.QtCore import QBuffer, QIODevice, QRect, Qt, QTimer, pyqtSignal
-from PyQt6.QtGui import QImage, QKeySequence, QPainter, QPixmap
+from PyQt6.QtCore import QBuffer, QIODevice, Qt, pyqtSignal
+from PyQt6.QtGui import QImage, QKeySequence, QPixmap
 from PyQt6.QtWidgets import (
     QAbstractItemView,
     QApplication,
@@ -92,81 +91,14 @@ class _ClickableLabel(QLabel):
         super().mousePressEvent(event)
 
 
-class _MarqueeLabel(QWidget):
-    """文件名跑马灯：文本超出列宽时共享定时器向左滚动。"""
-
-    # 弱引用集合：表格重建会丢弃大量旧标签，避免实例被永久持有
-    _instances: "weakref.WeakSet[_MarqueeLabel]" = weakref.WeakSet()
-    _timer: QTimer | None = None
+class _FileNameLabel(QLabel):
+    """稳定显示文件名；完整内容由悬停提示提供，避免跑马灯持续重绘。"""
 
     def __init__(self, text: str = "", parent=None):
-        super().__init__(parent)
-        self._text = text
-        self._offset = 0.0
+        super().__init__(text, parent)
+        self.setTextFormat(Qt.TextFormat.PlainText)
+        self.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
         self.setMinimumHeight(24)
-        self._EnsureTimer()
-        _MarqueeLabel._instances.add(self)
-
-    def setText(self, text: str) -> None:  # noqa: N802 —— 覆盖 QWidget 语义
-        self._text = text
-        self._offset = 0.0
-        self.update()
-
-    def _TextWidth(self) -> int:
-        return self.fontMetrics().horizontalAdvance(self._text)
-
-    @classmethod
-    def _EnsureTimer(cls) -> None:
-        if cls._timer is None:
-            cls._timer = QTimer()
-            cls._timer.setInterval(60)
-            cls._timer.timeout.connect(cls._Tick)
-            cls._timer.start()
-
-    @classmethod
-    def _Tick(cls) -> None:
-        dead: list[_MarqueeLabel] = []
-        for widget in cls._instances:
-            try:
-                if widget.isHidden():
-                    continue
-                text_width = widget._TextWidth()
-                if text_width > widget.width():
-                    widget._offset += 1
-                    if widget._offset > text_width + 40:
-                        widget._offset = 0
-                    widget.update()
-                elif widget._offset:
-                    widget._offset = 0
-                    widget.update()
-            except RuntimeError:
-                dead.append(widget)
-        for widget in dead:
-            cls._instances.remove(widget)
-
-    def paintEvent(self, event) -> None:  # noqa: N802 —— Qt 事件
-        painter = QPainter(self)
-        painter.setPen(self.palette().color(self.foregroundRole()))
-        rect = self.rect()
-        text_width = self._TextWidth()
-        if text_width <= rect.width():
-            painter.drawText(
-                rect,
-                Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
-                self._text,
-            )
-            return
-        painter.save()
-        painter.setClipRect(rect)
-        gap = 40
-        x = -int(self._offset)
-        for start in (x, x + text_width + gap):
-            painter.drawText(
-                QRect(start, 0, text_width + gap, rect.height()),
-                Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
-                self._text,
-            )
-        painter.restore()
 
 
 class _CellEditor(QWidget):
@@ -318,7 +250,7 @@ class _FormatDialog(QDialog):
 
 
 class _CoverDialog(QDialog):
-    """封面小窗：选择文件 / 粘贴图片 / 提取全部封面 / 移除封面。"""
+    """封面小窗：按当前范围选择、粘贴或移除封面。"""
 
     def __init__(self, parent, scope_text: str, ffmpeg_path: str, export_items, temp_dir: Path):
         super().__init__(parent)
@@ -342,11 +274,13 @@ class _CoverDialog(QDialog):
         button_row = QHBoxLayout()
         choose_button = PushButton("选择图片文件…", self)
         paste_button = PushButton("粘贴图片", self)
-        export_button = PushButton("提取全部封面…", self)
         remove_button = PushButton("移除封面", self)
         button_row.addWidget(choose_button)
         button_row.addWidget(paste_button)
-        button_row.addWidget(export_button)
+        export_button = None
+        if export_items is not None:
+            export_button = PushButton("提取全部封面…", self)
+            button_row.addWidget(export_button)
         button_row.addWidget(remove_button)
         layout.addLayout(button_row)
 
@@ -360,9 +294,10 @@ class _CoverDialog(QDialog):
         info_layout.addWidget(
             CaptionLabel("支持选择图片文件或直接粘贴图片（Ctrl+V）。", self)
         )
-        info_layout.addWidget(
-            CaptionLabel("提取全部封面：从磁盘上的原始音频提取，未确认的内存修改不算。", self)
-        )
+        if export_items is not None:
+            info_layout.addWidget(
+                CaptionLabel("提取全部封面：从磁盘上的原始音频提取，未确认的内存修改不算。", self)
+            )
         info_layout.addStretch(1)
         preview_row.addLayout(info_layout, 1)
         layout.addLayout(preview_row)
@@ -378,11 +313,14 @@ class _CoverDialog(QDialog):
         buttons.addWidget(ok_button)
         layout.addLayout(buttons)
 
-        self._buttons = [choose_button, paste_button, export_button, remove_button, ok_button]
+        self._buttons = [choose_button, paste_button, remove_button, ok_button]
+        if export_button is not None:
+            self._buttons.append(export_button)
 
         choose_button.clicked.connect(self._OnChoose)
         paste_button.clicked.connect(self._OnPaste)
-        export_button.clicked.connect(self._OnExportAll)
+        if export_button is not None:
+            export_button.clicked.connect(self._OnExportAll)
         remove_button.clicked.connect(self._OnRemove)
         ok_button.clicked.connect(self._OnOk)
         cancel_button.clicked.connect(self.reject)
@@ -449,7 +387,7 @@ class _CoverDialog(QDialog):
 
     # ---- 提取全部封面 -------------------------------------------------
     def _OnExportAll(self) -> None:
-        if self._export_worker is not None:
+        if self._export_worker is not None or self.export_items is None:
             return
         directory = QFileDialog.getExistingDirectory(self, "选择封面输出目录", "")
         if not directory:
@@ -590,6 +528,10 @@ class MetadataPage(QWidget):
         body_layout.setSpacing(10)
         card.viewLayout.addWidget(body)
         return card, body_layout
+
+    def AddBottomWidget(self, widget: QWidget) -> None:
+        """把音频页的附加入口放入同一个滚动流的末尾。"""
+        self.content_layout.insertWidget(self.content_layout.count() - 1, widget)
 
     @staticmethod
     def _MakeFieldLabel(text: str, parent: QWidget) -> StrongBodyLabel:
@@ -993,7 +935,7 @@ class MetadataPage(QWidget):
         format_cell.clicked.connect(lambda _checked=False, r=row: self._OnFormatCellClicked(r))
         self.table.setCellWidget(row_index, 0, format_cell)
 
-        name_cell = _MarqueeLabel(row.file_name)
+        name_cell = _FileNameLabel(row.file_name)
         name_cell.setToolTip(row.file_name)
         self.table.setCellWidget(row_index, 1, name_cell)
 
@@ -1225,7 +1167,12 @@ class MetadataPage(QWidget):
             scope_text = f"将统一应用到全部 {len(self._rows)} 个文件"
         else:
             scope_text = f"仅修改：{scope_row.file_name}"
-        export_items = [(row.path, row.cover_codec) for row in self._rows if row.error is None]
+        # "提取全部" 是批量操作，只在点击列标题的统一编辑窗口中提供。
+        export_items = None
+        if scope_row is None:
+            export_items = [
+                (row.path, row.cover_codec) for row in self._rows if row.error is None
+            ]
         dialog = _CoverDialog(self, scope_text, ffmpeg, export_items, self._cover_temp_path)
         if dialog.exec() == QDialog.DialogCode.Accepted and dialog.result_action is not None:
             self._ApplyCoverResult(dialog.result_action, dialog.cover_source, scope_row)

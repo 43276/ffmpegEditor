@@ -88,15 +88,16 @@ class FfmpegCapabilities:
 def ProbeFfmpeg(ffmpeg_path: str) -> FfmpegCapabilities:
     """运行 ffmpeg -version / -encoders / -muxers，探测可用编码能力。"""
     try:
-        version_result = subprocess.run(
-            [ffmpeg_path, "-version"], capture_output=True, text=True, timeout=30
-        )
-        encoders_result = subprocess.run(
-            [ffmpeg_path, "-encoders"], capture_output=True, text=True, timeout=30
-        )
-        muxers_result = subprocess.run(
-            [ffmpeg_path, "-muxers"], capture_output=True, text=True, timeout=30
-        )
+        run_options = {
+            "capture_output": True,
+            "text": True,
+            "encoding": "utf-8",
+            "errors": "replace",
+            "timeout": 30,
+        }
+        version_result = subprocess.run([ffmpeg_path, "-version"], **run_options)
+        encoders_result = subprocess.run([ffmpeg_path, "-encoders"], **run_options)
+        muxers_result = subprocess.run([ffmpeg_path, "-muxers"], **run_options)
     except OSError as exc:
         raise ConverterError(f"无法运行 ffmpeg：{exc}") from exc
 
