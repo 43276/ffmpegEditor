@@ -1,6 +1,6 @@
-# 图片 / 音频批量处理工具
+# 图片 / 视频 / 音频批量处理工具
 
-基于 **FFmpeg** 的图片格式转换 / 压缩与音频封面 / 元数据批处理桌面工具。
+基于 **FFmpeg** 的图片格式转换 / 压缩、视频压缩与音频封面 / 元数据批处理桌面工具。
 
 ## 运行环境
 
@@ -53,6 +53,16 @@
 - **单帧格式保护**：动画 GIF / WebP 转成 JPG / PNG / AVIF / BMP / TIFF 等
   单帧格式时只取第一帧，避免 ffmpeg 因“同名文件写入多帧”而直接失败。
 - 输入规则（A / B / C）、输出位置与命名规则与其它格式完全一致。
+
+### 视频处理 → 视频压缩
+
+边栏进入“视频处理”后可将视频批量压缩为 MP4：
+
+- 支持 `.mp4`、`.m4v`、`.mkv`、`.mov`、`.avi`、`.webm`、`.flv`、`.wmv`、`.ts`；
+- 输入遵循相同的 A / B / C 目录规则，并默认忽略已有的 `*_output` 目录；
+- 输出为 `<源文件名>.mp4`，写入新建的 `*_output` 目录，**不会修改或删除源文件**；
+- 可选择 H.264（兼容优先）或 H.265 / HEVC（体积优先）、CRF 画质、编码速度与 AAC 音频码率；
+- H.265 仅在当前 FFmpeg 提供 `libx265` 时可选；视频流以外的数据流不写入 MP4。
 
 ### 音频处理 → 专辑批处理
 
@@ -117,7 +127,8 @@ compress_images/
 │   ├── Core.py          # 图片 A/B/C 目录规则、批次构建、参数模型
 │   ├── Converter.py     # ffmpeg 探测 / 命令行构建 / 执行
 │   ├── AddCover.py      # 专辑封面 / 元数据批处理核心逻辑
-│   └── MetadataEdit.py  # 音频元数据编辑 / 格式转换 / 封面提取核心逻辑
+│   ├── MetadataEdit.py  # 音频元数据编辑 / 格式转换 / 封面提取核心逻辑
+│   └── VideoCore.py     # 视频 A/B/C 目录规则与压缩命令构建
 └── ui/
     ├── MainWindow.py    # Win11 风格主窗口（图片处理模块）
     ├── Worker.py        # 图片后台转换线程
@@ -125,7 +136,9 @@ compress_images/
     ├── AlbumPage.py     # 专辑批处理页面
     ├── AlbumWorker.py   # 专辑批处理后台线程
     ├── MetadataPage.py  # 元数据编辑页面
-    └── MetadataWorker.py# 元数据编辑后台线程
+    ├── MetadataWorker.py# 元数据编辑后台线程
+    ├── VideoPage.py     # 视频压缩页面
+    └── VideoWorker.py   # 视频压缩后台线程
 ```
 
 ## 备注

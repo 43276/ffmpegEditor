@@ -85,11 +85,16 @@ class _ProbeThread(QThread):
         except Exception as exc:  # noqa: BLE001 —— 统一转成用户可见消息
             self.probeFailed.emit(str(exc))
 
+    @property
+    def ffmpeg_path(self) -> str:
+        return self._ffmpeg_path
+
 
 class ImagePage(QWidget):
     """独立的图片处理页面；FFmpeg 状态变化通过信号交给窗口协调。"""
 
     ffmpegPathChanged = pyqtSignal(object)
+    ffmpegCapabilitiesChanged = pyqtSignal(object, object)
 
     # ---- 初始化 -------------------------------------------------------
     def __init__(self, parent=None):
@@ -577,6 +582,8 @@ class ImagePage(QWidget):
             self._UpdateStartState()
             return
         self._active_ffmpeg_path = ffmpeg_path
+        # 路径刚切换时，旧路径的编码能力不能继续给依赖页面使用。
+        self._caps = None
         self._SyncFfmpegToAudio()
 
         if self._probe_thread is not None and self._probe_thread.isRunning():
@@ -592,6 +599,7 @@ class ImagePage(QWidget):
     def _SyncFfmpegToAudio(self) -> None:
         """通知窗口协调器向音频、视频等其它页面同步 FFmpeg 路径。"""
         self.ffmpegPathChanged.emit(self._active_ffmpeg_path)
+        self.ffmpegCapabilitiesChanged.emit(self._active_ffmpeg_path, self._caps)
 
     @property
     def ffmpeg_path(self) -> str | None:
@@ -605,16 +613,22 @@ class ImagePage(QWidget):
             self._ProbeCurrentFfmpeg()
 
     def _OnProbeFinished(self, caps: FfmpegCapabilities) -> None:
+        if self._probe_thread is None or self._probe_thread.ffmpeg_path != self._active_ffmpeg_path:
+            return
         self._caps = caps
         enabled = "，AVIF 可用" if caps.avif_ok else "（不支持 AVIF）"
         self.ffmpeg_status_label.setText(f"✓ {caps.version}{enabled}")
         self._UpdateFormatCombo()
         self._settings.setValue("ffmpeg/path", self.ffmpeg_line.text().strip())
+        self._SyncFfmpegToAudio()
         self._UpdateStartState()
 
     def _OnProbeFailed(self, message: str) -> None:
+        if self._probe_thread is None or self._probe_thread.ffmpeg_path != self._active_ffmpeg_path:
+            return
         self._caps = None
         self.ffmpeg_status_label.setText(f"✗ {message}")
+        self._SyncFfmpegToAudio()
         self._UpdateStartState()
         self._ShowInfoBar("ffmpeg 检测失败", message, error=True)
 
