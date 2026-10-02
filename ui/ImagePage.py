@@ -9,18 +9,15 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
-from PyQt6.QtCore import QSettings, Qt, QThread, pyqtSignal
+from PyQt6.QtCore import QSettings, Qt
 from PyQt6.QtGui import QTextCursor
 from PyQt6.QtWidgets import (
     QButtonGroup,
-    QAbstractItemView,
     QFileDialog,
     QGridLayout,
     QHBoxLayout,
     QVBoxLayout,
     QWidget,
-    QListView,
-    QTreeView,
 )
 
 from qfluentwidgets import (
@@ -33,7 +30,6 @@ from qfluentwidgets import (
     ProgressBar,
     PushButton,
     RadioButton,
-    ScrollArea,
     Slider,
     SpinBox,
     StrongBodyLabel,
@@ -43,10 +39,7 @@ from qfluentwidgets import (
 from qfluentwidgets.common.style_sheet import isDarkTheme
 
 from app.Converter import (
-    ConverterError,
     FfmpegCapabilities,
-    LocateFfmpeg,
-    ProbeFfmpeg,
 )
 from app.Core import (
     BuildBatchesForInputs,
@@ -58,6 +51,7 @@ from app.Core import (
     MakeTaskOutputName,
 )
 from ui.Controls import MakeSwitchButton
+from ui.SmoothScroll import SmoothScrollArea as ScrollArea
 from ui.Worker import LOG_ERROR, LOG_INFO, LOG_OK, LOG_WARN, ConvertWorker
 
 # 深浅主题下的日志颜色
@@ -69,32 +63,8 @@ _LOG_COLORS = {
 _LEVEL_MARKS = {LOG_OK: "✓ ", LOG_WARN: "⚠ ", LOG_ERROR: "✗ "}
 
 
-class _ProbeThread(QThread):
-    """探测 ffmpeg 能力的后台线程。"""
-
-    probeFinished = pyqtSignal(object)
-    probeFailed = pyqtSignal(str)
-
-    def __init__(self, ffmpeg_path: str, parent=None):
-        super().__init__(parent)
-        self._ffmpeg_path = ffmpeg_path
-
-    def run(self) -> None:
-        try:
-            self.probeFinished.emit(ProbeFfmpeg(self._ffmpeg_path))
-        except Exception as exc:  # noqa: BLE001 —— 统一转成用户可见消息
-            self.probeFailed.emit(str(exc))
-
-    @property
-    def ffmpeg_path(self) -> str:
-        return self._ffmpeg_path
-
-
 class ImagePage(QWidget):
-    """独立的图片处理页面；FFmpeg 状态变化通过信号交给窗口协调。"""
-
-    ffmpegPathChanged = pyqtSignal(object)
-    ffmpegCapabilitiesChanged = pyqtSignal(object, object)
+    """独立的图片处理页面；共享 FFmpeg 状态由主窗口提供。"""
 
     # ---- 初始化 -------------------------------------------------------
     def __init__(self, parent=None):
@@ -109,8 +79,6 @@ class ImagePage(QWidget):
         self._worker_summaries: dict[int, dict] = {}
         self._thread_progress: dict[int, tuple[int, int]] = {}
         self._planned_total = 0
-        self._probe_thread: _ProbeThread | None = None
-        self._pending_probe_path: str | None = None
         self._input_paths: list[Path] = []
         self._preview_batches = None
         self._last_output_dirs: list[str] = []
@@ -137,10 +105,6 @@ class ImagePage(QWidget):
         self._OnOutputModeChanged()
         self._UpdateQualityUi()
         self._UpdateStartState()
-
-    def StartFfmpegProbe(self) -> None:
-        """页面已挂载后再启动探测，初始化异常时不会遗留工作线程。"""
-        self._ProbeCurrentFfmpeg()
 
     def _BuildScrollContent(self) -> None:
         self.home_interface = ScrollArea(self)
@@ -293,24 +257,10 @@ class ImagePage(QWidget):
         grid.addWidget(self.overwrite_switch, row, 1)
         row += 1
 
-        # ffmpeg
-        grid.addWidget(self._MakeFieldLabel("ffmpeg", card), row, 0)
-        ffmpeg_row = QHBoxLayout()
-        self.ffmpeg_line = LineEdit(card)
-        self.ffmpeg_line.setPlaceholderText("未设置时自动从 PATH 查找")
-        self.ffmpeg_line.setClearButtonEnabled(True)
-        browse_ffmpeg_button = PushButton("浏览…", card)
-        ffmpeg_row.addWidget(self.ffmpeg_line, 1)
-        ffmpeg_row.addWidget(browse_ffmpeg_button)
-        grid.addLayout(ffmpeg_row, row, 1)
-        row += 1
-
         self.quality_hint_label = CaptionLabel("", card)
         layout.addWidget(self.quality_hint_label)
         self.ffmpeg_status_label = CaptionLabel("正在检测 ffmpeg…", card)
         layout.addWidget(self.ffmpeg_status_label)
-
-        self.browse_ffmpeg_button = browse_ffmpeg_button
 
     @staticmethod
     def _MakeFieldLabel(text: str, parent: QWidget) -> StrongBodyLabel:
@@ -385,11 +335,9 @@ class ImagePage(QWidget):
     def _ConnectSignals(self) -> None:
         self.browse_file_button.clicked.connect(self._OnBrowseFile)
         self.browse_dir_button.clicked.connect(self._OnBrowseDir)
-        self.browse_ffmpeg_button.clicked.connect(self._OnBrowseFfmpeg)
         self.browse_root_button.clicked.connect(self._OnBrowseOutputRoot)
         self.path_line.editingFinished.connect(self._OnPathEdited)
         self.path_line.textEdited.connect(self._OnPathTextEdited)
-        self.ffmpeg_line.editingFinished.connect(self._ProbeCurrentFfmpeg)
         self.output_root_line.editingFinished.connect(self._RefreshPreview)
         self.auto_radio.toggled.connect(lambda _checked: self._OnOutputModeChanged())
         self.custom_radio.toggled.connect(lambda _checked: self._OnOutputModeChanged())
@@ -430,14 +378,11 @@ class ImagePage(QWidget):
             self._SetInputPaths([Path(path) for path in file_paths])
 
     def _OnBrowseDir(self) -> None:
-        dialog = QFileDialog(self, "选择文件夹", self.path_line.text().strip() or "")
-        dialog.setFileMode(QFileDialog.FileMode.Directory)
-        dialog.setOption(QFileDialog.Option.ShowDirsOnly, True)
-        dialog.setOption(QFileDialog.Option.DontUseNativeDialog, True)
-        for view in dialog.findChildren((QListView, QTreeView)):
-            view.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
-        if dialog.exec():
-            self._SetInputPaths([Path(path) for path in dialog.selectedFiles()])
+        directory = QFileDialog.getExistingDirectory(
+            self, "选择图片文件夹", self.path_line.text().strip() or ""
+        )
+        if directory:
+            self._SetInputPaths([Path(directory)])
 
     def _SetInputPath(self, path_text: str) -> None:
         self._SetInputPaths([Path(path_text)])
@@ -561,76 +506,13 @@ class ImagePage(QWidget):
             )
         self._RefreshPreview()
 
-    # ---- ffmpeg 探测 --------------------------------------------------
-    def _OnBrowseFfmpeg(self) -> None:
-        file_path, _filter = QFileDialog.getOpenFileName(
-            self, "选择 ffmpeg.exe", self.ffmpeg_line.text().strip() or "", "ffmpeg (ffmpeg.exe);;所有文件 (*)"
-        )
-        if file_path:
-            self.ffmpeg_line.setText(file_path)
-            self._ProbeCurrentFfmpeg()
-
-    def _ProbeCurrentFfmpeg(self) -> None:
-        explicit = self.ffmpeg_line.text().strip() or None
-        try:
-            ffmpeg_path = LocateFfmpeg(explicit)
-        except ConverterError as exc:
-            self._active_ffmpeg_path = None
-            self.ffmpeg_status_label.setText(f"✗ {exc}")
-            self._caps = None
-            self._SyncFfmpegToAudio()
-            self._UpdateStartState()
-            return
-        self._active_ffmpeg_path = ffmpeg_path
-        # 路径刚切换时，旧路径的编码能力不能继续给依赖页面使用。
-        self._caps = None
-        self._SyncFfmpegToAudio()
-
-        if self._probe_thread is not None and self._probe_thread.isRunning():
-            self._pending_probe_path = ffmpeg_path
-            return
-        self._probe_thread = _ProbeThread(ffmpeg_path, self)
-        self._probe_thread.probeFinished.connect(self._OnProbeFinished)
-        self._probe_thread.probeFailed.connect(self._OnProbeFailed)
-        self._probe_thread.finished.connect(self._OnProbeThreadFinished)
-        self.ffmpeg_status_label.setText("正在检测 ffmpeg…")
-        self._probe_thread.start()
-
-    def _SyncFfmpegToAudio(self) -> None:
-        """通知窗口协调器向音频、视频等其它页面同步 FFmpeg 路径。"""
-        self.ffmpegPathChanged.emit(self._active_ffmpeg_path)
-        self.ffmpegCapabilitiesChanged.emit(self._active_ffmpeg_path, self._caps)
-
-    @property
-    def ffmpeg_path(self) -> str | None:
-        """当前已定位的 FFmpeg 路径，供页面挂载后的首次同步使用。"""
-        return self._active_ffmpeg_path
-
-    def _OnProbeThreadFinished(self) -> None:
-        pending = self._pending_probe_path
-        self._pending_probe_path = None
-        if pending:
-            self._ProbeCurrentFfmpeg()
-
-    def _OnProbeFinished(self, caps: FfmpegCapabilities) -> None:
-        if self._probe_thread is None or self._probe_thread.ffmpeg_path != self._active_ffmpeg_path:
-            return
-        self._caps = caps
-        enabled = "，AVIF 可用" if caps.avif_ok else "（不支持 AVIF）"
-        self.ffmpeg_status_label.setText(f"✓ {caps.version}{enabled}")
+    # ---- 共享 FFmpeg 状态 ---------------------------------------------
+    def SetFfmpegPath(self, path: str | None, capabilities: FfmpegCapabilities | None, message: str) -> None:
+        self._active_ffmpeg_path = path
+        self._caps = capabilities
+        self.ffmpeg_status_label.setText(message)
         self._UpdateFormatCombo()
-        self._settings.setValue("ffmpeg/path", self.ffmpeg_line.text().strip())
-        self._SyncFfmpegToAudio()
         self._UpdateStartState()
-
-    def _OnProbeFailed(self, message: str) -> None:
-        if self._probe_thread is None or self._probe_thread.ffmpeg_path != self._active_ffmpeg_path:
-            return
-        self._caps = None
-        self.ffmpeg_status_label.setText(f"✗ {message}")
-        self._SyncFfmpegToAudio()
-        self._UpdateStartState()
-        self._ShowInfoBar("ffmpeg 检测失败", message, error=True)
 
     def _UpdateFormatCombo(self) -> None:
         if self._caps is None:
@@ -941,10 +823,6 @@ class ImagePage(QWidget):
         self._UpdateLogExportButtons()
 
     def _RestoreSettings(self) -> None:
-        saved_path = self._settings.value("ffmpeg/path", "", type=str)
-        if saved_path:
-            self.ffmpeg_line.setText(saved_path)
-
         saved_inputs = self._settings.value("input/paths", "", type=str)
         if saved_inputs:
             try:
@@ -980,7 +858,6 @@ class ImagePage(QWidget):
         self._settings.setValue(
             "input/paths", json.dumps([str(path) for path in self._input_paths], ensure_ascii=False)
         )
-        self._settings.setValue("ffmpeg/path", self.ffmpeg_line.text().strip())
         self._settings.setValue("output/root", self.output_root_line.text().strip())
         self._settings.setValue("output/custom", self.custom_radio.isChecked())
         self._settings.setValue("input/include_output", self.include_output_switch.isChecked())
@@ -1002,8 +879,6 @@ class ImagePage(QWidget):
             worker.RequestCancel()
         for worker in list(self._workers):
             worker.wait()
-        if self._probe_thread is not None and self._probe_thread.isRunning():
-            self._probe_thread.wait()
         self._workers.clear()
 
     def closeEvent(self, event) -> None:  # noqa: N802 —— Qt 事件

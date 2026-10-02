@@ -1,0 +1,226 @@
+"""共享配置、视频停止语义与滚动的回归检查（不修改用户设置）。"""
+from __future__ import annotations
+
+import os
+import tempfile
+import threading
+import time
+import unittest
+from pathlib import Path
+from unittest.mock import patch
+
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+
+from PyQt6.QtCore import QPoint, QPointF, QSettings, Qt
+from PyQt6.QtGui import QWheelEvent
+from PyQt6.QtTest import QTest
+from PyQt6.QtWidgets import QApplication, QLabel, QVBoxLayout, QWidget
+
+from app.Converter import FfmpegCapabilities
+from app.VideoCore import VideoBatch, VideoCompressOptions
+from ui.FfmpegService import FfmpegService
+from ui.SmoothScroll import SmoothScrollArea
+from ui.VideoPage import VideoPage
+from ui.VideoWorker import VideoCompressWorker
+
+
+CAPS = FfmpegCapabilities("test FFmpeg", {"libx264"}, None, False, True)
+APP = QApplication.instance() or QApplication([])
+APP.setQuitOnLastWindowClosed(False)
+
+
+def WaitUntil(predicate, seconds=3):
+    deadline = time.monotonic() + seconds
+    while not predicate():
+        if time.monotonic() > deadline:
+            raise AssertionError("等待 Qt 事件超时")
+        QTest.qWait(10)
+    APP.processEvents()
+
+
+class RegressionTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(prefix="ffmpeg_regression_")
+        self.root = Path(self.temp.name)
+        self.settings = QSettings(str(self.root / "settings.ini"), QSettings.Format.IniFormat)
+
+    def tearDown(self):
+        APP.processEvents()
+        self.temp.cleanup()
+
+    def test_ffmpeg_path_change_during_probe_discards_old_capabilities(self):
+        entered, release = threading.Event(), threading.Event()
+        states = []
+
+        def probe(path):
+            if path == "old.exe":
+                entered.set()
+                release.wait(2)
+            return FfmpegCapabilities(path, {"libx264"}, None, False, True)
+
+        service = FfmpegService(self.settings)
+        service.stateChanged.connect(lambda *state: states.append(state))
+        try:
+            with patch("ui.FfmpegService.LocateFfmpeg", side_effect=lambda path: path), patch("ui.FfmpegService.ProbeFfmpeg", side_effect=probe):
+                service.SetPath("old.exe")
+                WaitUntil(entered.is_set)
+                service.SetPath("new.exe")
+                release.set()
+                WaitUntil(lambda: service._worker is None)
+            self.assertEqual(states[-1][0], "new.exe")
+            self.assertEqual(states[-1][1].version, "new.exe")
+            self.assertFalse(any(state[0] == "old.exe" for state in states))
+            self.assertEqual(self.settings.value("ffmpeg/path"), "new.exe")
+        finally:
+            release.set()
+            service.Shutdown()
+
+    def test_invalid_explicit_ffmpeg_path_stays_unavailable(self):
+        states = []
+        service = FfmpegService(self.settings)
+        service.stateChanged.connect(lambda *state: states.append(state))
+        try:
+            service.SetPath(str(self.root / "missing.exe"))
+            WaitUntil(lambda: service._worker is None)
+            self.assertIsNone(states[-1][0])
+            self.assertIsNone(states[-1][1])
+            self.assertIn("路径不存在", states[-1][2])
+        finally:
+            service.Shutdown()
+
+    def test_video_cancel_cleans_partial_output_and_can_restart(self):
+        source = self.root / "source.mp4"
+        source.write_bytes(b"original video")
+        entered = threading.Event()
+        with patch("ui.VideoPage.QSettings", return_value=self.settings):
+            page = VideoPage()
+        page.SetFfmpegPath("ffmpeg.exe", CAPS)
+        page._SetInputs([source])
+        summaries = []
+
+        def process(command, cancel_check):
+            partial = Path(command[-1])
+            partial.write_bytes(b"partial video")
+            entered.set()
+            deadline = time.monotonic() + 2
+            while not cancel_check() and time.monotonic() < deadline:
+                time.sleep(0.005)
+            return -1, "", cancel_check()
+
+        try:
+            with patch("ui.VideoWorker.RunFileProcess", side_effect=process), patch.object(page, "_ShowInfo"):
+                page._Start()
+                page._worker.taskFinished.connect(summaries.append)
+                WaitUntil(entered.is_set)
+                page._Cancel()
+                self.assertFalse(page.cancel_button.isEnabled())
+                WaitUntil(lambda: page._worker is None)
+                self.assertEqual(page.status.text(), "已取消")
+                self.assertTrue(summaries[-1]["cancelled"])
+                self.assertFalse(list(self.root.rglob("*.part.mp4")))
+                self.assertEqual(source.read_bytes(), b"original video")
+
+            def success(command, cancel_check):
+                Path(command[-1]).write_bytes(b"compressed video")
+                return 0, "", False
+
+            with patch("ui.VideoWorker.RunFileProcess", side_effect=success), patch.object(page, "_ShowInfo"):
+                page._Start()
+                self.assertIn("正在压缩", page.status.text())
+                WaitUntil(lambda: page._worker is None)
+                self.assertIn("压缩完成", page.status.text())
+                self.assertTrue(page.start_button.isEnabled())
+                self.assertEqual((self.root / "source_output" / "source.mp4").read_bytes(), b"compressed video")
+                self.assertEqual(source.read_bytes(), b"original video")
+        finally:
+            page.Shutdown()
+            page.deleteLater()
+
+    def test_video_end_finishes_every_file_in_current_batch_only(self):
+        sources = [self.root / name for name in ("first.mp4", "second.mp4", "later.mp4")]
+        for source in sources:
+            source.write_bytes(b"original")
+        batches = [
+            VideoBatch(self.root, self.root / "first_output", sources[:2]),
+            VideoBatch(self.root, self.root / "later_output", sources[2:]),
+        ]
+        worker = VideoCompressWorker(batches, VideoCompressOptions("ffmpeg.exe"), CAPS)
+        calls, summaries = [], []
+        worker.taskFinished.connect(summaries.append)
+
+        def process(command, cancel_check):
+            calls.append(command)
+            Path(command[-1]).write_bytes(b"compressed")
+            worker.RequestFinishAfterCurrentBatch()
+            return 0, "", False
+
+        try:
+            with patch("ui.VideoWorker.RunFileProcess", side_effect=process):
+                worker.start()
+                WaitUntil(lambda: bool(summaries))
+                worker.wait()
+            self.assertEqual(len(calls), 2)
+            self.assertTrue(summaries[-1]["early_stopped"])
+            self.assertEqual(summaries[-1]["ok"], 2)
+            self.assertFalse((self.root / "later_output").exists())
+            self.assertTrue(all(source.read_bytes() == b"original" for source in sources))
+        finally:
+            worker.RequestCancel()
+            worker.wait()
+
+    def test_window_driven_scroll_completes_and_stops(self):
+        area = SmoothScrollArea()
+        content = QWidget()
+        content.setMinimumSize(200, 1600)
+        area.setWidget(content)
+        area.resize(400, 300)
+        area.show()
+        try:
+            QTest.qWait(30)
+            event = QWheelEvent(QPointF(100, 100), QPointF(100, 100), QPoint(), QPoint(0, -120), Qt.MouseButton.NoButton, Qt.KeyboardModifier.NoModifier, Qt.ScrollPhase.NoScrollPhase, False)
+            APP.sendEvent(area.viewport(), event)
+            WaitUntil(lambda: not area._animator._active)
+            self.assertEqual(area.verticalScrollBar().value(), 180)
+            self.assertTrue(content.updatesEnabled())
+            QTest.qWait(50)
+            self.assertEqual(area.verticalScrollBar().value(), 180)
+        finally:
+            area.close()
+            area.deleteLater()
+
+    def test_scroll_snapshot_restores_live_content_on_hide_and_resize(self):
+        area = SmoothScrollArea()
+        content = QWidget()
+        content.setMinimumSize(200, 1600)
+        layout = QVBoxLayout(content)
+        label = QLabel("old", content)
+        layout.addWidget(label)
+        area.setWidget(content)
+        area.resize(400, 300)
+        area.show()
+        try:
+            QTest.qWait(30)
+            def wheel():
+                event = QWheelEvent(QPointF(100, 100), QPointF(100, 100), QPoint(), QPoint(0, -120), Qt.MouseButton.NoButton, Qt.KeyboardModifier.NoModifier, Qt.ScrollPhase.NoScrollPhase, False)
+                APP.sendEvent(area.viewport(), event)
+
+            wheel()
+            self.assertFalse(content.updatesEnabled())
+            label.setText("new")
+            area.resize(500, 350)
+            APP.processEvents()
+            self.assertFalse(area._animator._active)
+            self.assertTrue(content.updatesEnabled())
+            self.assertEqual(label.text(), "new")
+            wheel()
+            self.assertFalse(content.updatesEnabled())
+            area.hide()
+            self.assertTrue(content.updatesEnabled())
+            self.assertFalse(area._animator._active)
+        finally:
+            area.close()
+            area.deleteLater()
+
+
+if __name__ == "__main__":
+    unittest.main()

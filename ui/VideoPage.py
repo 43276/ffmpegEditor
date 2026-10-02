@@ -11,13 +11,14 @@ from PyQt6.QtGui import QTextCursor
 from PyQt6.QtWidgets import QFileDialog, QHBoxLayout, QVBoxLayout, QWidget
 from qfluentwidgets import (
     CaptionLabel, ComboBox, HeaderCardWidget, InfoBar, LineEdit, PrimaryPushButton,
-    ProgressBar, PushButton, ScrollArea, Slider, StrongBodyLabel, TextBrowser, TitleLabel, InfoBarPosition,
+    ProgressBar, PushButton, Slider, StrongBodyLabel, TextBrowser, TitleLabel, InfoBarPosition,
 )
 from qfluentwidgets.common.style_sheet import isDarkTheme
 
 from app.Converter import FfmpegCapabilities
 from app.VideoCore import BuildVideoBatchesForInputs, SummarizeVideoBatches, VideoCompressOptions, VideoInputError
 from ui.Controls import MakeSwitchButton
+from ui.SmoothScroll import SmoothScrollArea as ScrollArea
 from ui.VideoWorker import VideoCompressWorker
 from ui.Worker import LOG_ERROR, LOG_INFO, LOG_OK, LOG_WARN
 
@@ -38,6 +39,8 @@ class VideoPage(QWidget):
         self._caps: FfmpegCapabilities | None = None
         self._inputs: list[Path] = []
         self._worker: VideoCompressWorker | None = None
+        self._cancel_requested = False
+        self._finish_requested = False
         self._last_output_dirs: list[str] = []
 
         outer = QVBoxLayout(self)
@@ -240,7 +243,7 @@ class VideoPage(QWidget):
         elif path:
             self.ffmpeg_status.setText(f"✓ {path}（正在等待编码器能力检测）")
         else:
-            self.ffmpeg_status.setText("✗ FFmpeg 未就绪，请先在“图片处理”页设置 FFmpeg 路径")
+            self.ffmpeg_status.setText("✗ FFmpeg 未就绪，请在“设置”页检查 FFmpeg 路径")
         self._UpdateEncoderAvailability()
         self._UpdateState()
 
@@ -251,8 +254,10 @@ class VideoPage(QWidget):
             self.encoder_combo.setCurrentIndex(0)
 
     def _Start(self) -> None:
+        if self._worker is not None:
+            return
         if not self._caps or not self._ffmpeg_path:
-            self._ShowInfo("无法开始", "FFmpeg 尚未就绪，请检查图片处理页中的 FFmpeg 设置", error=True)
+            self._ShowInfo("无法开始", "FFmpeg 尚未就绪，请检查设置页中的 FFmpeg 路径", error=True)
             return
         try:
             batches = self._CurrentBatches()
@@ -266,6 +271,9 @@ class VideoPage(QWidget):
         )
         total = sum(len(batch.files) for batch in batches)
         self._last_output_dirs = []
+        self._cancel_requested = False
+        self._finish_requested = False
+        self.status.setText(f"正在压缩：0/{total}")
         self.log_browser.clear()
         self.progress.setRange(0, total)
         self.progress.setValue(0)
@@ -281,18 +289,23 @@ class VideoPage(QWidget):
 
     def _Progress(self, done: int, total: int, current: str) -> None:
         self.progress.setValue(done)
-        self.status.setText(f"进度 {done}/{total}：{current}")
+        if not self._cancel_requested and not self._finish_requested:
+            self.status.setText(f"进度 {done}/{total}：{current}")
 
     def _Finished(self, summary: dict) -> None:
         self._last_output_dirs = summary["output_dirs"]
         self._SetStatistics(summary["total"], summary["ok"], summary["failed"], summary["skipped"])
         if summary["cancelled"]:
+            self.status.setText("已取消")
             self._ShowInfo("任务已取消", "本次压缩已中止")
         elif summary["early_stopped"]:
+            self.status.setText("已结束：当前文件夹已完成")
             self._ShowInfo("已按“结束”停止", "当前文件夹已完成，后续文件夹未开始", warning=True)
         elif summary["failed"]:
+            self.status.setText(f"压缩完成：成功 {summary['ok']}，失败 {summary['failed']}，跳过 {summary['skipped']}")
             self._ShowInfo("压缩完成（有失败项）", f"成功 {summary['ok']}，失败 {summary['failed']}，跳过 {summary['skipped']}", warning=True)
         else:
+            self.status.setText(f"压缩完成：成功 {summary['ok']}，跳过 {summary['skipped']}")
             self._ShowInfo("压缩完成", f"成功 {summary['ok']} 个视频，跳过 {summary['skipped']}")
 
     def _WorkerStopped(self) -> None:
@@ -301,15 +314,17 @@ class VideoPage(QWidget):
 
     def _Cancel(self) -> None:
         if self._worker:
+            self._cancel_requested = True
             self.status.setText("正在取消…")
             self._worker.RequestCancel()
             self._UpdateState()
 
     def _End(self) -> None:
         if self._worker:
+            self._finish_requested = True
             self.status.setText("正在处理当前文件夹，之后将停止…")
             self._worker.RequestFinishAfterCurrentBatch()
-            self.end_button.setEnabled(False)
+            self._UpdateState()
 
     def _OpenOutputFolders(self) -> None:
         for directory in self._last_output_dirs[:5]:
@@ -340,8 +355,8 @@ class VideoPage(QWidget):
     def _UpdateState(self) -> None:
         running = self._worker is not None
         self.start_button.setEnabled(bool(self._caps and self._inputs) and not running)
-        self.cancel_button.setEnabled(running)
-        self.end_button.setEnabled(running)
+        self.cancel_button.setEnabled(running and not self._cancel_requested)
+        self.end_button.setEnabled(running and not self._cancel_requested and not self._finish_requested)
         self.file_button.setEnabled(not running)
         self.dir_button.setEnabled(not running)
         self.open_folder_button.setEnabled(not running and bool(self._last_output_dirs))

@@ -24,7 +24,6 @@ from qfluentwidgets import (
     PrimaryPushButton,
     ProgressBar,
     PushButton,
-    ScrollArea,
     StrongBodyLabel,
     TextBrowser,
     TitleLabel,
@@ -32,9 +31,9 @@ from qfluentwidgets import (
 from qfluentwidgets.common.style_sheet import isDarkTheme
 
 from app.AddCover import AlbumPlan, BuildAlbumPlan, SummarizeAlbumPlan
-from app.Converter import ConverterError, LocateFfmpeg
 from ui.AlbumWorker import AlbumWorker
 from ui.Controls import MakeSwitchButton
+from ui.SmoothScroll import SmoothScrollArea as ScrollArea
 from ui.Worker import LOG_ERROR, LOG_INFO, LOG_OK, LOG_WARN
 
 # 深浅主题下的日志颜色
@@ -312,7 +311,7 @@ class AlbumPage(QWidget):
         if path:
             self.ffmpeg_status_label.setText(f"✓ {path}")
         else:
-            self.ffmpeg_status_label.setText("✗ ffmpeg 未就绪，请先在“图片处理”页设置 ffmpeg")
+            self.ffmpeg_status_label.setText("✗ FFmpeg 未就绪，请在“设置”页检查 FFmpeg 路径")
         self._UpdateStartState()
 
     # ---- 任务执行 -----------------------------------------------------
@@ -324,13 +323,8 @@ class AlbumPage(QWidget):
 
         ffmpeg_path = self._ffmpeg_path
         if ffmpeg_path is None:
-            try:
-                ffmpeg_path = LocateFfmpeg(None)
-            except ConverterError as exc:
-                self._ShowInfoBar("无法开始", str(exc), error=True)
-                return
-            self._ffmpeg_path = ffmpeg_path
-            self.ffmpeg_status_label.setText(f"✓ {ffmpeg_path}")
+            self._ShowInfoBar("无法开始", "FFmpeg 尚未就绪，请在设置页检查路径", error=True)
+            return
 
         try:
             plan = BuildAlbumPlan(root)
