@@ -733,7 +733,10 @@ class ImagePage(QWidget):
         )
         try:
             # 不携带 /f：给系统与其它程序优雅退出的机会
-            subprocess.run(["shutdown", "/s", "/t", "60"], check=False, timeout=10)
+            subprocess.run(
+                ["shutdown", "/s", "/t", "60"], check=False, timeout=10,
+                creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
+            )
         except OSError as exc:
             self._AppendLog(LOG_ERROR, f"自动关机命令执行失败：{exc}")
 

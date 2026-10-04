@@ -194,7 +194,8 @@ def _RunFfprobe(ffprobe_path: str, audio_path: Path) -> tuple[bool, str, str]:
         # ffprobe 的 JSON 是 UTF-8；Windows 的 text=True 默认会按 GBK 解码，
         # 遇到含特殊字符的路径或标签会在后台 reader 线程直接抛 UnicodeDecodeError。
         result = subprocess.run(
-            cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=60
+            cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=60,
+            creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
         )
     except OSError as exc:
         return False, "", f"无法运行 ffprobe：{exc}"
@@ -266,7 +267,10 @@ def ExtractCoverThumbnail(ffmpeg_path: str, audio_path: Path) -> bytes | None:
         "-",
     ]
     try:
-        result = subprocess.run(cmd, capture_output=True, timeout=60)
+        result = subprocess.run(
+            cmd, capture_output=True, timeout=60,
+            creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
+        )
     except (OSError, subprocess.TimeoutExpired):
         return None
     if result.returncode != 0 or not result.stdout:
@@ -327,7 +331,8 @@ def ExtractCoverToFile(
     ]
     try:
         result = subprocess.run(
-            cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=60
+            cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=60,
+            creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
         )
     except OSError as exc:
         return None, f"无法运行 ffmpeg：{exc}"

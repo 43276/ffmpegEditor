@@ -1,6 +1,7 @@
 """ffmpeg 封装：探测能力、按参数构建命令行、执行单文件转换。"""
 from __future__ import annotations
 
+import os
 import shutil
 import subprocess
 import tempfile
@@ -94,6 +95,8 @@ def ProbeFfmpeg(ffmpeg_path: str) -> FfmpegCapabilities:
             "encoding": "utf-8",
             "errors": "replace",
             "timeout": 30,
+            # --windowed 只控制主程序，Windows 子进程需单独禁止创建控制台。
+            "creationflags": subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
         }
         version_result = subprocess.run([ffmpeg_path, "-version"], **run_options)
         encoders_result = subprocess.run([ffmpeg_path, "-encoders"], **run_options)
@@ -253,7 +256,12 @@ def RunFileProcess(
 
     with tempfile.TemporaryFile(mode="w+t", encoding="utf-8", errors="replace") as error_file:
         try:
-            proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=error_file)
+            proc = subprocess.Popen(
+                cmd,
+                stdout=subprocess.DEVNULL,
+                stderr=error_file,
+                creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
+            )
         except OSError as exc:
             return -1, f"无法启动 ffmpeg：{exc}", False
 
