@@ -1,8 +1,9 @@
 __pycache__/
-app/__pycache__/
-ui/__pycache__/
 .reasonix/
+build/
+dist/
 
+*.spec
 requirements.txt
 tasks.md
 agent.md
