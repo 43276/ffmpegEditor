@@ -22,7 +22,8 @@ from app.video.models import VideoBatch, VideoCompressOptions
 from ui.FfmpegService import FfmpegService
 from ui.SmoothScroll import SmoothScrollArea
 from ui.VideoPage import VideoPage
-from ui.VideoWorker import VideoCompressWorker
+from ui.tasks.worker import TaskWorker
+from ui.tasks.jobs import video_job
 
 
 CAPS = FfmpegCapabilities("test FFmpeg", {"libx264"}, {"mp4"})
@@ -53,7 +54,7 @@ class RegressionTests(unittest.TestCase):
         entered, release = threading.Event(), threading.Event()
         states = []
 
-        def probe(path):
+        def probe(path, **kwargs):
             if path == "old.exe":
                 entered.set()
                 release.wait(2)
@@ -75,6 +76,7 @@ class RegressionTests(unittest.TestCase):
         finally:
             release.set()
             service.Shutdown()
+            WaitUntil(lambda: not service.active)
 
     def test_invalid_explicit_ffmpeg_path_stays_unavailable(self):
         states = []
@@ -88,6 +90,7 @@ class RegressionTests(unittest.TestCase):
             self.assertIn("路径不存在", states[-1][2])
         finally:
             service.Shutdown()
+            WaitUntil(lambda: not service.active)
 
     def test_video_cancel_cleans_partial_output_and_can_restart(self):
         source = self.root / "source.mp4"
@@ -111,11 +114,11 @@ class RegressionTests(unittest.TestCase):
         try:
             with patch("app.converter.execute", side_effect=process), patch.object(page, "_ShowInfo"):
                 page._Start()
-                page._worker.taskFinished.connect(summaries.append)
+                page._task_controller.completed.connect(lambda _kind, result: summaries.append(result))
                 WaitUntil(entered.is_set)
                 page._Cancel()
                 self.assertFalse(page.cancel_button.isEnabled())
-                WaitUntil(lambda: page._worker is None)
+                WaitUntil(lambda: not page._task_controller.active)
                 self.assertEqual(page.status.text(), "已取消")
                 self.assertTrue(summaries[-1].cancelled)
                 self.assertFalse(list(self.root.rglob("*.part.mp4")))
@@ -128,13 +131,14 @@ class RegressionTests(unittest.TestCase):
             with patch("app.converter.execute", side_effect=success), patch.object(page, "_ShowInfo"):
                 page._Start()
                 self.assertIn("正在压缩", page.status.text())
-                WaitUntil(lambda: page._worker is None)
+                WaitUntil(lambda: not page._task_controller.active)
                 self.assertIn("压缩完成", page.status.text())
                 self.assertTrue(page.start_button.isEnabled())
                 self.assertEqual((self.root / "source_output" / "source.mp4").read_bytes(), b"compressed video")
                 self.assertEqual(source.read_bytes(), b"original video")
         finally:
             page.Shutdown()
+            WaitUntil(lambda: not page._task_controller.active)
             page.deleteLater()
 
     def test_video_end_finishes_every_file_in_current_batch_only(self):
@@ -145,14 +149,14 @@ class RegressionTests(unittest.TestCase):
             VideoBatch(self.root, self.root / "first_output", sources[:2]),
             VideoBatch(self.root, self.root / "later_output", sources[2:]),
         ]
-        worker = VideoCompressWorker(batches, VideoCompressOptions("ffmpeg.exe"), CAPS)
+        worker = TaskWorker(1, video_job(batches, VideoCompressOptions("ffmpeg.exe"), CAPS))
         calls, summaries = [], []
-        worker.taskFinished.connect(summaries.append)
+        worker.taskFinished.connect(lambda _id, result: summaries.append(result))
 
         def process(command, cancel_check, **kwargs):
             calls.append(command)
             Path(command[-1]).write_bytes(b"compressed")
-            worker.RequestFinishAfterCurrentBatch()
+            worker.request_finish_after_current_batch()
             return ProcessResult(0)
 
         try:
@@ -166,7 +170,7 @@ class RegressionTests(unittest.TestCase):
             self.assertFalse((self.root / "later_output").exists())
             self.assertTrue(all(source.read_bytes() == b"original" for source in sources))
         finally:
-            worker.RequestCancel()
+            worker.request_cancel()
             worker.wait()
 
     def test_window_driven_scroll_completes_and_stops(self):

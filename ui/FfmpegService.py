@@ -1,7 +1,9 @@
 """共享 FFmpeg 配置与异步能力检测。"""
 from __future__ import annotations
 
-from PyQt6.QtCore import QObject, QSettings, QThread, pyqtSignal
+from threading import Event
+
+from PyQt6.QtCore import QObject, QSettings, QThread, Qt, pyqtSignal
 
 from app.ffmpeg_environment import locate_ffmpeg, probe_ffmpeg
 
@@ -13,17 +15,22 @@ class _ProbeThread(QThread):
         self.path = None
         self.capabilities = None
         self.error = ""
+        self._cancel = Event()
+
+    def RequestCancel(self) -> None:
+        self._cancel.set()
 
     def run(self) -> None:
         try:
             self.path = locate_ffmpeg(self.explicit or None)
-            self.capabilities = probe_ffmpeg(self.path)
+            self.capabilities = probe_ffmpeg(self.path, cancel_check=self._cancel.is_set)
         except Exception as exc:  # noqa: BLE001 -- 在线程结束后统一报告
             self.error = str(exc)
 
 
 class FfmpegService(QObject):
     stateChanged = pyqtSignal(object, object, str)
+    idle = pyqtSignal()
 
     def __init__(self, settings: QSettings, parent=None):
         super().__init__(parent)
@@ -32,6 +39,10 @@ class FfmpegService(QObject):
         self._worker: _ProbeThread | None = None
         self._pending = False
         self._closing = False
+
+    @property
+    def active(self) -> bool:
+        return self._worker is not None
 
     def Start(self) -> None:
         if not self._closing:
@@ -48,7 +59,7 @@ class FfmpegService(QObject):
             self._pending = True
             return
         self._worker = _ProbeThread(self._explicit, self)
-        self._worker.finished.connect(self._CompleteProbe)
+        self._worker.finished.connect(self._CompleteProbe, Qt.ConnectionType.QueuedConnection)
         self._worker.start()
 
     def _CompleteProbe(self) -> None:
@@ -58,6 +69,7 @@ class FfmpegService(QObject):
             return
         worker.deleteLater()
         if self._closing:
+            self.idle.emit()
             return
         if self._pending:
             self._pending = False
@@ -66,8 +78,13 @@ class FfmpegService(QObject):
             self.stateChanged.emit(None, None, f"✗ {worker.error}")
         else:
             self.stateChanged.emit(worker.path, worker.capabilities, f"✓ {worker.capabilities.version}")
+        if not self.active:
+            self.idle.emit()
 
     def Shutdown(self) -> None:
         self._closing = True
+        self._pending = False
         if self._worker is not None:
-            self._worker.wait()
+            self._worker.RequestCancel()
+        else:
+            self.idle.emit()

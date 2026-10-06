@@ -18,6 +18,8 @@ class TaskRunner:
         on_log: Callable[[LogEvent], None] | None = None,
         on_progress: Callable[[TaskProgress], None] | None = None,
         on_statistics: Callable[[TaskStatistics], None] | None = None,
+        cancel_check: Callable[[], bool] | None = None,
+        finish_check: Callable[[], bool] | None = None,
     ) -> None:
         self._execute = execute
         self._on_log = on_log
@@ -25,12 +27,20 @@ class TaskRunner:
         self._on_statistics = on_statistics
         self._cancel = Event()
         self._finish = Event()
+        self._cancel_check = cancel_check
+        self._finish_check = finish_check
 
     def request_cancel(self) -> None:
         self._cancel.set()
 
     def request_finish_after_current_batch(self) -> None:
         self._finish.set()
+
+    def _cancel_requested(self) -> bool:
+        return self._cancel.is_set() or (self._cancel_check is not None and self._cancel_check())
+
+    def _finish_requested(self) -> bool:
+        return self._finish.is_set() or (self._finish_check is not None and self._finish_check())
 
     def _log(self, level: LogLevel, message: str) -> None:
         if self._on_log is not None:
@@ -69,13 +79,13 @@ class TaskRunner:
                 command = plan.command
                 execute = self._execute or converter.execute
                 for step in plan.preparation_steps:
-                    if self._cancel.is_set():
+                    if self._cancel_requested():
                         return "cancelled"
                     process = execute(
-                        step.command, cancel_check=self._cancel.is_set,
+                        step.command, cancel_check=self._cancel_requested,
                         timeout_seconds=step.timeout_seconds, capture_stdout=step.capture_stdout,
                     )
-                    if process.cancelled or self._cancel.is_set():
+                    if process.cancelled or self._cancel_requested():
                         return "cancelled"
                     output_missing = step.output_path is not None and not step.output_path.is_file()
                     if not process.succeeded or output_missing:
@@ -85,11 +95,11 @@ class TaskRunner:
                         self._log(LogLevel.WARN, f"{source}：{step.failure_warning}（{detail}）")
                         if step.fallback_command is not None:
                             command = step.fallback_command
-                if self._cancel.is_set():
+                if self._cancel_requested():
                     return "cancelled"
-                process = execute(command, cancel_check=self._cancel.is_set,
+                process = execute(command, cancel_check=self._cancel_requested,
                                   timeout_seconds=plan.timeout_seconds)
-                if process.cancelled or self._cancel.is_set():
+                if process.cancelled or self._cancel_requested():
                     return "cancelled"
                 if not process.succeeded:
                     return self._failed(result, f"{source} 处理失败：{process.stderr or '命令执行失败'}")
@@ -117,16 +127,16 @@ class TaskRunner:
         self._log(LogLevel.INFO, f"任务开始：{len(plan.batches)} 个批次、{plan.total} 个文件")
         self._statistics(result)
         for batch in plan.batches:
-            if self._cancel.is_set():
+            if self._cancel_requested():
                 result.cancelled = True
                 break
-            if self._finish.is_set():
+            if self._finish_requested():
                 result.early_stopped = True
                 break
             for event in batch.log_events:
                 self._log(event.level, event.message)
             for file_plan in batch.files:
-                if self._cancel.is_set():
+                if self._cancel_requested():
                     result.cancelled = True
                     break
                 status = self._run_file(file_plan, result)

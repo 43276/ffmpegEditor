@@ -9,7 +9,7 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
-from PyQt6.QtCore import QSettings, Qt
+from PyQt6.QtCore import QSettings, Qt, QTimer
 from PyQt6.QtGui import QTextCursor
 from PyQt6.QtWidgets import (
     QButtonGroup,
@@ -49,8 +49,9 @@ from ui.media_presentation import summarize_image_batches as SummarizeBatches, T
 from app.image.models import ConvertOptions
 from ui.Controls import MakeSwitchButton
 from ui.SmoothScroll import SmoothScrollArea as ScrollArea
-from app.task_models import LOG_ERROR, LOG_INFO, LOG_OK, LOG_WARN, TaskResult
-from ui.Worker import ConvertWorker
+from app.task_models import LOG_ERROR, LOG_INFO, LOG_OK, LOG_WARN, TaskProgress, TaskResult, TaskStatistics
+from ui.tasks.controller import TaskController, TaskState
+from ui.tasks.jobs import image_job
 
 # 深浅主题下的日志颜色
 _LOG_COLORS = {
@@ -73,10 +74,7 @@ class ImagePage(QWidget):
         self._settings = QSettings("CompressImages", "ImageConverter")
         self._caps: FfmpegCapabilities | None = None
         self._active_ffmpeg_path: str | None = None
-        self._workers: list[ConvertWorker] = []
-        self._worker_summaries: dict[int, TaskResult] = {}
-        self._thread_progress: dict[int, tuple[int, int]] = {}
-        self._planned_total = 0
+        self._task_controller = TaskController(self)
         self._input_paths: list[Path] = []
         self._preview_batches = None
         self._last_output_dirs: list[str] = []
@@ -84,6 +82,7 @@ class ImagePage(QWidget):
         self._skipped_logs: list[str] = []
         self._live_statistics = {"total": 0, "ok": 0, "failed": 0, "skipped": 0}
         self._closing = False
+        self._close_requested = False
 
         page_layout = QVBoxLayout(self)
         page_layout.setContentsMargins(0, 0, 0, 0)
@@ -95,6 +94,12 @@ class ImagePage(QWidget):
         self._BuildActionCard()
         self._BuildLogCard()
         self._ConnectSignals()
+        self._task_controller.logMessage.connect(lambda event: self._AppendLog(event.level, event.message))
+        self._task_controller.progressChanged.connect(self._OnTaskProgress)
+        self._task_controller.statisticsChanged.connect(self._OnTaskStatistics)
+        self._task_controller.completed.connect(self._OnTaskFinished)
+        self._task_controller.stateChanged.connect(self._UpdateStartState)
+        self._task_controller.idle.connect(self._OnTaskIdle)
 
         self.home_interface.setObjectName("homeInterface")
 
@@ -561,6 +566,8 @@ class ImagePage(QWidget):
 
     # ---- 任务执行 -----------------------------------------------------
     def _OnStartClicked(self) -> None:
+        if self._closing or self._task_controller.active:
+            return
         paths = self._CurrentInputPaths()
         if not paths:
             self._ShowInfoBar("无法开始", "请先选择输入文件或文件夹", error=True)
@@ -597,66 +604,33 @@ class ImagePage(QWidget):
 
         total = sum(len(batch.files) for batch in batches)
         self._SetStatistics(total=total, ok=0, failed=0, skipped=0)
-        self._planned_total = total
-        self._worker_summaries = {}
-        self._thread_progress = {}
         self.progress_bar.setRange(0, total)
         self.progress_bar.setValue(0)
-
-        # 只保留一个后台线程：避免多个 FFmpeg 进程争抢 CPU 和磁盘 I/O。
-        worker = ConvertWorker(1, batches, options, self._caps, self)
-        worker.logMessage.connect(self._OnWorkerLog)
-        worker.progressChanged.connect(self._OnWorkerProgress)
-        worker.statisticsChanged.connect(self._OnWorkerStatistics)
-        worker.taskFinished.connect(self._OnWorkerTaskFinished)
-        worker.finished.connect(lambda w=worker: self._OnWorkerThreadFinished(w))
-        worker.finished.connect(worker.deleteLater)
-        self._workers = [worker]
 
         self._AppendLog(
             LOG_INFO,
             f"任务开始：{len(batches)} 个批次、{total} 个文件，"
             "由后台线程顺序处理",
         )
-        for worker in self._workers:
-            worker.start()
+        self.status_label.setText(f"正在处理：0/{total}")
+        self._task_controller.start(image_job(batches, options, self._caps),
+                                    total=total, supports_finish=True)
         self._UpdateStartState()
 
-    def _OnWorkerLog(self, _thread_id: int, level: int, text: str) -> None:
-        self._AppendLog(level, text)
+    def _OnTaskProgress(self, progress: TaskProgress) -> None:
+        self.progress_bar.setValue(progress.done)
+        if self._task_controller.state == TaskState.RUNNING:
+            self.status_label.setText(f"进度 {progress.done}/{progress.total}")
 
-    def _OnWorkerProgress(
-        self, thread_id: int, done: int, _total: int, _current: str
-    ) -> None:
-        self._thread_progress[thread_id] = (done, _total)
-        sum_done = sum(value[0] for value in self._thread_progress.values())
-        self.progress_bar.setValue(min(sum_done, self._planned_total))
-        self.status_label.setText(f"进度 {sum_done}/{self._planned_total}")
+    def _OnTaskStatistics(self, stats: TaskStatistics) -> None:
+        self._SetStatistics(stats.total, stats.ok, stats.failed, stats.skipped)
 
-    def _OnWorkerStatistics(
-        self,
-        _thread_id: int,
-        total: int,
-        ok: int,
-        failed: int,
-        skipped: int,
-        _done: int,
-    ) -> None:
-        self._SetStatistics(total=total, ok=ok, failed=failed, skipped=skipped)
-
-    def _OnWorkerTaskFinished(self, thread_id: int, summary: TaskResult) -> None:
-        """收集各线程的汇总；全部线程结束后统一收尾。"""
-        self._worker_summaries[thread_id] = summary
-        if self._workers and len(self._worker_summaries) >= len(self._workers):
-            self._OnAllWorkersFinished(self._MergeSummaries())
-
-    def _MergeSummaries(self) -> TaskResult:
-        return TaskResult.merge(self._worker_summaries.values())
-
-    def _OnAllWorkersFinished(self, summary: TaskResult) -> None:
+    def _OnTaskFinished(self, _kind: str, summary: TaskResult) -> None:
         if summary.cancelled:
+            self.status_label.setText("已取消")
             self._ShowInfoBar("任务已取消", "本次处理被手动中止", error=False, warning=True)
         elif summary.early_stopped:
+            self.status_label.setText("已结束：当前文件夹已完成")
             self._ShowInfoBar(
                 "已按“结束”停止",
                 f"完成当前文件夹后停止：成功 {summary.ok}，失败 {summary.failed}，"
@@ -664,12 +638,14 @@ class ImagePage(QWidget):
                 warning=True,
             )
         elif summary.failed:
+            self.status_label.setText(f"处理完成：成功 {summary.ok}，失败 {summary.failed}，跳过 {summary.skipped}")
             self._ShowInfoBar(
                 "处理完成（有失败项）",
                 f"成功 {summary.ok}，失败 {summary.failed}，跳过 {summary.skipped}",
                 warning=True,
             )
         else:
+            self.status_label.setText(f"处理完成：成功 {summary.ok}，跳过 {summary.skipped}")
             self._ShowInfoBar(
                 "处理完成",
                 f"成功 {summary.ok} 个文件，跳过 {summary.skipped}",
@@ -687,11 +663,13 @@ class ImagePage(QWidget):
 
         # 任务真正全部结束后（取消 / 提前结束都不算完成）才考虑自动关机
         if (
-            not summary.cancelled
+            not self._closing
+            and not summary.cancelled
             and not summary.early_stopped
             and self.auto_shutdown_switch.isChecked()
         ):
             self._ScheduleShutdown()
+        self._UpdateStartState()
 
     def _ScheduleShutdown(self) -> None:
         """任务全部结束后执行系统关机：60 秒倒计时，可用 shutdown /a 取消。"""
@@ -711,32 +689,21 @@ class ImagePage(QWidget):
         except OSError as exc:
             self._AppendLog(LOG_ERROR, f"自动关机命令执行失败：{exc}")
 
-    def _OnWorkerThreadFinished(self, worker: ConvertWorker) -> None:
-        """单个线程结束后从活动列表移除；全部线程结束才恢复界面。"""
-        if worker in self._workers:
-            self._workers.remove(worker)
-        if not self._workers:
-            if self._last_output_dirs:
-                self.open_folder_button.setEnabled(True)
-            self._worker_summaries = {}
-            self._thread_progress = {}
-            self._UpdateStartState()
+    def _OnTaskIdle(self) -> None:
+        if self._close_requested:
+            QTimer.singleShot(0, self.close)
 
     def _OnCancelClicked(self) -> None:
-        if self._workers:
+        if self._task_controller.request_cancel():
             self.status_label.setText("正在取消…")
             self.cancel_button.setEnabled(False)
             self.end_button.setEnabled(False)
-            for worker in self._workers:
-                worker.RequestCancel()
 
     def _OnEndClicked(self) -> None:
         """结束：处理完当前正在处理的文件夹后停止，不再开始新文件夹。"""
-        if self._workers:
+        if self._task_controller.request_finish_after_current_batch():
             self.status_label.setText("正在处理当前文件夹，之后将停止…")
             self.end_button.setEnabled(False)
-            for worker in self._workers:
-                worker.RequestFinishAfterCurrentBatch()
 
     def _OnOpenFolder(self) -> None:
         opened = 0
@@ -761,12 +728,12 @@ class ImagePage(QWidget):
         )
 
     def _UpdateLogExportButtons(self) -> None:
-        running = bool(self._workers)
+        running = self._task_controller.active or self._closing
         self.export_error_button.setEnabled(not running and bool(self._error_logs))
         self.export_skipped_button.setEnabled(not running and bool(self._skipped_logs))
 
     def _ExportLog(self, title: str, default_name: str, entries: list[str]) -> None:
-        if not entries or self._workers:
+        if not entries or self._task_controller.active or self._closing:
             return
         file_path, _filter = QFileDialog.getSaveFileName(
             self, title, default_name, "文本文件 (*.txt);;所有文件 (*.*)"
@@ -788,10 +755,11 @@ class ImagePage(QWidget):
 
     def _UpdateStartState(self) -> None:
         has_path = bool(self._CurrentInputPaths())
-        running = bool(self._workers)
+        running = self._task_controller.active or self._closing
         self.start_button.setEnabled(self._caps is not None and has_path and not running)
-        self.cancel_button.setEnabled(running)
-        self.end_button.setEnabled(running)
+        self.cancel_button.setEnabled(self._task_controller.can_cancel and not self._closing)
+        self.end_button.setEnabled(self._task_controller.can_finish and not self._closing)
+        self.open_folder_button.setEnabled(not running and bool(self._last_output_dirs))
         self.browse_file_button.setEnabled(not running)
         self.browse_dir_button.setEnabled(not running)
         self._UpdateLogExportButtons()
@@ -843,21 +811,22 @@ class ImagePage(QWidget):
         self._settings.sync()
 
     def Shutdown(self) -> None:
-        """保存页面偏好并停止图片转换/探测线程。"""
+        """保存页面偏好并请求停止；线程结束由 Controller 通知。"""
         if self._closing:
             return
         self._closing = True
         self._SaveSettings()
 
-        for worker in list(self._workers):
-            worker.RequestCancel()
-        for worker in list(self._workers):
-            worker.wait()
-        self._workers.clear()
+        self._task_controller.shutdown()
+        self._UpdateStartState()
 
     def closeEvent(self, event) -> None:  # noqa: N802 —— Qt 事件
+        self._close_requested = True
         self.Shutdown()
-        event.accept()
+        if self._task_controller.active:
+            event.ignore()
+        else:
+            event.accept()
 
     def _AppendLog(self, level: int, text: str) -> None:
         timestamp = datetime.now().strftime("%H:%M:%S")
@@ -881,6 +850,8 @@ class ImagePage(QWidget):
         error: bool = False,
         warning: bool = False,
     ) -> None:
+        if self._closing:
+            return
         info_bar = InfoBar.new
         if error:
             info_bar = InfoBar.error

@@ -7,7 +7,9 @@ import shutil
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Callable
 
+from . import converter
 from .errors import FfmpegError
 
 
@@ -66,13 +68,24 @@ def parse_name_tokens(text: str) -> frozenset[str]:
     return frozenset(names)
 
 
-def probe_ffmpeg(ffmpeg_path: str) -> FfmpegCapabilities:
+def probe_ffmpeg(ffmpeg_path: str, *, cancel_check: Callable[[], bool] | None = None) -> FfmpegCapabilities:
     options = dict(
         capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=30,
         creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
     )
     outputs: dict[str, str] = {}
     for argument in ("-version", "-encoders", "-muxers"):
+        if cancel_check is not None:
+            result = converter.execute([ffmpeg_path, argument], cancel_check=cancel_check,
+                                       timeout_seconds=30, capture_stdout=True)
+            if result.cancelled or cancel_check():
+                raise FfmpegError("FFmpeg 检测已取消")
+            if result.timed_out:
+                raise FfmpegError(f"ffmpeg 检测超时（{argument}）")
+            if not result.succeeded:
+                raise FfmpegError(f"ffmpeg 检测失败（{argument}）：{result.stderr or '未知错误'}")
+            outputs[argument] = result.stdout.decode("utf-8", errors="replace")
+            continue
         try:
             result = subprocess.run([ffmpeg_path, argument], **options)
         except OSError as exc:

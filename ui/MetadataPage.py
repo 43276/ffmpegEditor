@@ -9,7 +9,7 @@ import time
 from datetime import datetime
 from pathlib import Path
 
-from PyQt6.QtCore import QBuffer, QIODevice, Qt, pyqtSignal
+from PyQt6.QtCore import QBuffer, QIODevice, Qt, QTimer, pyqtSignal
 from PyQt6.QtGui import QImage, QKeySequence, QPixmap
 from PyQt6.QtWidgets import (
     QAbstractItemView,
@@ -55,8 +55,9 @@ from app.audio.metadata_planner import MetadataError, apply_cover_edit
 from ui.media_presentation import format_audio_edit
 from ui.Controls import MakeSwitchButton
 from ui.SmoothScroll import SmoothScrollArea as ScrollArea
-from ui.MetadataWorker import CoverExportWorker, MetadataReadWorker, MetadataWriteWorker
-from app.task_models import LOG_ERROR, LOG_INFO, LOG_OK, LOG_WARN, TaskResult
+from ui.tasks.controller import TaskController, TaskState
+from ui.tasks.jobs import cover_export_job, metadata_read_job, metadata_write_job
+from app.task_models import LOG_ERROR, LOG_INFO, LOG_OK, LOG_WARN, TaskProgress, TaskResult, TaskStatistics
 
 _LOG_COLORS = {
     LOG_OK: ("#0f7b0f", "#7adfa0"),
@@ -245,6 +246,8 @@ class _FormatDialog(QDialog):
 class _CoverDialog(QDialog):
     """封面小窗：按当前范围选择、粘贴或移除封面。"""
 
+    idle = pyqtSignal()
+
     def __init__(self, parent, scope_text: str, ffmpeg_path: str, export_items, temp_dir: Path):
         super().__init__(parent)
         self.setWindowTitle("封面")
@@ -256,7 +259,8 @@ class _CoverDialog(QDialog):
         self.result_action: str | None = None   # "set" | "remove" | None
         self.cover_source: Path | None = None
         self._remove_requested = False
-        self._export_worker: CoverExportWorker | None = None
+        self._export_controller = TaskController(self)
+        self._pending_done: int | None = None
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(20, 18, 20, 16)
@@ -317,6 +321,16 @@ class _CoverDialog(QDialog):
         remove_button.clicked.connect(self._OnRemove)
         ok_button.clicked.connect(self._OnOk)
         cancel_button.clicked.connect(self.reject)
+        self._export_controller.progressChanged.connect(self._OnExportProgress)
+        self._export_controller.completed.connect(self._OnExportFinished)
+        self._export_controller.stateChanged.connect(
+            lambda _state: self._SetExporting(self._export_controller.active))
+        self._export_controller.idle.connect(self._FinishPendingClose)
+        self._export_controller.idle.connect(self.idle)
+
+    @property
+    def active(self) -> bool:
+        return self._export_controller.active
 
     # ---- 封面选择 -----------------------------------------------------
     def _OnChoose(self) -> None:
@@ -380,29 +394,27 @@ class _CoverDialog(QDialog):
 
     # ---- 提取全部封面 -------------------------------------------------
     def _OnExportAll(self) -> None:
-        if self._export_worker is not None or self.export_items is None:
+        if self.active or self._pending_done is not None or self.export_items is None:
             return
         directory = QFileDialog.getExistingDirectory(self, "选择封面输出目录", "")
         if not directory:
             return
-        self._export_worker = CoverExportWorker(
-            99, self.ffmpeg_path, self.export_items, directory, self
-        )
-        self._export_worker.progressChanged.connect(self._OnExportProgress)
-        self._export_worker.taskFinished.connect(self._OnExportFinished)
-        self._export_worker.finished.connect(self._export_worker.deleteLater)
-        self._export_worker.start()
+        self._export_controller.start(cover_export_job(self.ffmpeg_path, self.export_items, directory),
+                                      total=len(self.export_items), kind="export")
         self._SetExporting(True)
         self.status_label.setText("正在提取全部封面…")
 
-    def _OnExportProgress(self, _thread_id: int, done: int, total: int, name: str) -> None:
-        self.status_label.setText(f"正在提取全部封面 {done}/{total}：{name}")
+    def _OnExportProgress(self, progress: TaskProgress) -> None:
+        if self._pending_done is None:
+            self.status_label.setText(
+                f"正在提取全部封面 {progress.done}/{progress.total}：{progress.current_file}")
 
-    def _OnExportFinished(self, _thread_id: int, summary: TaskResult) -> None:
-        self._export_worker = None
+    def _OnExportFinished(self, _kind: str, summary: TaskResult) -> None:
+        if self._pending_done is not None:
+            return
         self._SetExporting(False)
         self.status_label.setText(
-            f"导出完成：成功 {summary.ok}，跳过 {summary.skipped}，"
+            f"{'导出已取消' if summary.cancelled else '导出完成'}：成功 {summary.ok}，跳过 {summary.skipped}，"
             f"失败 {summary.failed} → {summary.output_dir}"
         )
 
@@ -410,25 +422,29 @@ class _CoverDialog(QDialog):
         for button in self._buttons:
             button.setEnabled(not exporting)
 
-    def _StopExport(self) -> None:
-        """终止仍在运行的封面导出线程。
+    def _FinishPendingClose(self) -> None:
+        if self._pending_done is not None:
+            result = self._pending_done
+            self._pending_done = None
+            super().done(result)
 
-        导出线程以本对话框为父对象，若窗口先被销毁而线程仍在运行，
-        Qt 会直接中止进程（QThread: Destroyed while thread is still running）。
-        """
-        worker = self._export_worker
-        if worker is None:
-            return
-        self._export_worker = None
-        worker.RequestCancel()
-        worker.wait(5000)
+    def Shutdown(self) -> None:
+        self.reject()
 
     def closeEvent(self, event) -> None:  # noqa: N802 —— Qt 事件
-        self._StopExport()
-        super().closeEvent(event)
+        if self.active:
+            event.ignore()
+            self.done(QDialog.DialogCode.Rejected)
+        else:
+            super().closeEvent(event)
 
     def done(self, result: int) -> None:  # noqa: N802 —— Qt 方法
-        self._StopExport()
+        if self.active:
+            self._pending_done = result
+            self._SetExporting(True)
+            self.status_label.setText("正在取消导出，等待线程结束…")
+            self._export_controller.shutdown()
+            return
         super().done(result)
 
     # ---- 结果 ---------------------------------------------------------
@@ -442,7 +458,7 @@ class _CoverDialog(QDialog):
         self.accept()
 
     def keyPressEvent(self, event) -> None:  # noqa: N802 —— Qt 事件
-        if event.matches(QKeySequence.StandardKey.Paste):
+        if event.matches(QKeySequence.StandardKey.Paste) and not self.active:
             self._OnPaste()
         else:
             super().keyPressEvent(event)
@@ -463,20 +479,24 @@ class MetadataPage(QWidget):
         self._write_mode = "inplace"
         self._ffmpeg_path: str | None = None
         self._ffprobe_path: str | None = None
-        self._read_worker: MetadataReadWorker | None = None
-        self._workers: list[MetadataWriteWorker] = []
-        self._worker_summaries: dict[int, TaskResult] = {}
-        self._thread_progress: dict[int, tuple[int, int]] = {}
-        self._planned_total = 0
+        self._task_controller = TaskController(self)
         self._live_statistics = {"total": 0, "ok": 0, "failed": 0, "skipped": 0}
         self._error_logs: list[str] = []
         self._last_output_dirs: list[str] = []
         self._closing = False
+        self._close_requested = False
         self._cover_temp_dir = tempfile.TemporaryDirectory(prefix="meta_covers_ui_")
         self._cover_temp_path = Path(self._cover_temp_dir.name)
 
         self._BuildUi()
         self._ConnectSignals()
+        self._task_controller.logMessage.connect(lambda event: self._AppendLog(event.level, event.message))
+        self._task_controller.progressChanged.connect(self._OnTaskProgress)
+        self._task_controller.statisticsChanged.connect(self._OnTaskStatistics)
+        self._task_controller.rowLoaded.connect(self._OnReadRowLoaded)
+        self._task_controller.completed.connect(self._OnTaskFinished)
+        self._task_controller.stateChanged.connect(self._UpdateControls)
+        self._task_controller.idle.connect(self._TryCleanupCovers)
         self._RebuildTable()
         self._UpdateControls()
 
@@ -772,7 +792,7 @@ class MetadataPage(QWidget):
         self._StartImport(paths)
 
     def _StartImport(self, paths: list[Path]) -> None:
-        if self._read_worker is not None or self._workers:
+        if self._closing or self._task_controller.active:
             self._ShowInfoBar("请稍候", "正在读取或写入中", warning=True)
             return
         if not paths:
@@ -804,32 +824,24 @@ class MetadataPage(QWidget):
         self.progress_bar.setValue(0)
         self._AppendLog(LOG_INFO, f"开始导入 {len(unique)} 个音频文件…")
 
-        worker = MetadataReadWorker(1, ffprobe, ffmpeg, unique, self)
-        worker.logMessage.connect(self._OnWorkerLog)
-        worker.progressChanged.connect(self._OnReadProgress)
-        worker.rowLoaded.connect(self._OnReadRowLoaded)
-        worker.taskFinished.connect(self._OnReadTaskFinished)
-        worker.finished.connect(worker.deleteLater)
-        self._read_worker = worker
-        worker.start()
+        self._task_controller.start(metadata_read_job(ffprobe, ffmpeg, unique),
+                                    total=len(unique), kind="read")
         self._UpdateControls()
 
-    def _OnReadRowLoaded(self, _thread_id: int, edit: TrackEdit) -> None:
+    def _OnReadRowLoaded(self, edit: TrackEdit) -> None:
+        if self._closing:
+            return
         self._rows.append(edit)
         self._AppendRow(edit)
         self._UpdateModifiedStatus()
 
-    def _OnReadProgress(self, _thread_id: int, done: int, total: int, name: str) -> None:
-        self.progress_bar.setValue(done)
-        self.status_label.setText(f"正在导入 {done}/{total}：{name}")
-
-    def _OnReadTaskFinished(self, _thread_id: int, summary: TaskResult) -> None:
-        self._read_worker = None
-        self._UpdateControls()
+    def _OnReadTaskFinished(self, summary: TaskResult) -> None:
         if self._closing:
             return
-        self.progress_bar.setValue(self.progress_bar.maximum())
-        if summary.failed:
+        if summary.cancelled:
+            self.status_label.setText(f"导入已取消 · 共 {len(self._rows)} 个文件")
+            self._ShowInfoBar("导入已取消", f"已读取 {summary.ok} 个文件", warning=True)
+        elif summary.failed:
             self._ShowInfoBar(
                 "导入完成（部分失败）",
                 f"成功 {summary.ok}，失败 {summary.failed}",
@@ -837,7 +849,9 @@ class MetadataPage(QWidget):
             )
         else:
             self._ShowInfoBar("导入完成", f"共读取 {summary.ok} 个文件")
-        self.status_label.setText(f"共 {len(self._rows)} 个文件")
+        if not summary.cancelled:
+            self.progress_bar.setValue(self.progress_bar.maximum())
+            self.status_label.setText(f"共 {len(self._rows)} 个文件")
         self._SetDefaultOutputRoot()
 
     def _SetDefaultOutputRoot(self) -> None:
@@ -1094,7 +1108,7 @@ class MetadataPage(QWidget):
         self._UpdateModifiedStatus()
 
     def _OpenTextDialog(self, field, scope_row: TrackEdit | None) -> None:
-        if not self._rows:
+        if not self._rows or self._closing or self._task_controller.active:
             return
         if scope_row is None:
             scope_text = f"将统一应用到全部 {len(self._rows)} 个文件"
@@ -1121,7 +1135,7 @@ class MetadataPage(QWidget):
             self._UpdateModifiedStatus()
 
     def _OpenFormatDialog(self, scope_row: TrackEdit | None) -> None:
-        if not self._rows:
+        if not self._rows or self._closing or self._task_controller.active:
             return
         if scope_row is None:
             scope_text = f"将统一应用到全部 {len(self._rows)} 个文件"
@@ -1151,7 +1165,7 @@ class MetadataPage(QWidget):
         self._UpdateModifiedStatus()
 
     def _OpenCoverDialog(self, scope_row: TrackEdit | None) -> None:
-        if not self._rows:
+        if not self._rows or self._closing or self._task_controller.active:
             return
         ffmpeg = self._EnsureFfmpeg()
         if ffmpeg is None:
@@ -1167,8 +1181,12 @@ class MetadataPage(QWidget):
                 (row.path, row.cover_codec) for row in self._rows if row.error is None
             ]
         dialog = _CoverDialog(self, scope_text, ffmpeg, export_items, self._cover_temp_path)
-        if dialog.exec() == QDialog.DialogCode.Accepted and dialog.result_action is not None:
-            self._ApplyCoverResult(dialog.result_action, dialog.cover_source, scope_row)
+        try:
+            if (dialog.exec() == QDialog.DialogCode.Accepted and not self._closing
+                    and dialog.result_action is not None):
+                self._ApplyCoverResult(dialog.result_action, dialog.cover_source, scope_row)
+        finally:
+            dialog.deleteLater()
 
     def _ApplyCoverResult(
         self,
@@ -1202,7 +1220,7 @@ class MetadataPage(QWidget):
         if not modified:
             self._ShowInfoBar("没有修改", "表格中没有未确认的修改", warning=True)
             return
-        if self._read_worker is not None or self._workers:
+        if self._closing or self._task_controller.active:
             return
         ffmpeg = self._EnsureFfmpeg()
         if ffmpeg is None:
@@ -1221,52 +1239,42 @@ class MetadataPage(QWidget):
             row.backup = self.backup_switch.isChecked() if in_place else False
 
         self._error_logs = []
-        self._worker_summaries = {}
-        self._thread_progress = {}
-        self._planned_total = len(modified)
         self.progress_bar.setRange(0, len(modified))
         self.progress_bar.setValue(0)
         self._SetStatistics(total=len(modified), ok=0, failed=0, skipped=0)
 
-        worker = MetadataWriteWorker(
-            1,
-            ffmpeg,
-            modified,
-            self.overwrite_switch.isChecked(),
-            in_place,
-            output_root,
-            self,
-        )
-        worker.logMessage.connect(self._OnWorkerLog)
-        worker.progressChanged.connect(self._OnWorkerProgress)
-        worker.statisticsChanged.connect(self._OnWorkerStatistics)
-        worker.taskFinished.connect(self._OnWorkerTaskFinished)
-        worker.finished.connect(lambda w=worker: self._OnWorkerThreadFinished(w))
-        worker.finished.connect(worker.deleteLater)
-        self._workers = [worker]
         self._AppendLog(LOG_INFO, f"确认修改开始：{len(modified)} 个文件")
-        worker.start()
+        self._task_controller.start(metadata_write_job(
+            ffmpeg, modified, self.overwrite_switch.isChecked(), in_place, output_root),
+            total=len(modified), kind="write")
         self._UpdateControls()
 
-    def _OnWorkerProgress(self, _thread_id: int, done: int, _total: int, _name: str) -> None:
-        self.progress_bar.setValue(done)
-        self.status_label.setText(f"正在写入 {done}/{self._planned_total}")
+    def _OnTaskProgress(self, progress: TaskProgress) -> None:
+        self.progress_bar.setValue(progress.done)
+        if self._task_controller.state != TaskState.RUNNING:
+            return
+        if self._task_controller.kind == "read":
+            self.status_label.setText(
+                f"正在导入 {progress.done}/{progress.total}：{progress.current_file}")
+        else:
+            self.status_label.setText(f"正在写入 {progress.done}/{progress.total}")
 
-    def _OnWorkerStatistics(
-        self, _thread_id: int, total: int, ok: int, failed: int, skipped: int, _done: int
-    ) -> None:
-        self._SetStatistics(total=total, ok=ok, failed=failed, skipped=skipped)
+    def _OnTaskStatistics(self, stats: TaskStatistics) -> None:
+        self._SetStatistics(stats.total, stats.ok, stats.failed, stats.skipped)
 
-    def _OnWorkerTaskFinished(self, thread_id: int, summary: TaskResult) -> None:
-        self._worker_summaries[thread_id] = summary
-        if self._workers and len(self._worker_summaries) >= len(self._workers):
-            self._OnAllWorkersFinished(self._MergeSummaries())
+    def _OnTaskFinished(self, kind: str, summary: TaskResult) -> None:
+        if kind == "read":
+            self._OnReadTaskFinished(summary)
+            self._UpdateControls()
+            return
+        self._OnWriteTaskFinished(summary)
+        # 线程已真实结束，才允许开始读取磁盘上的最新状态。
+        if not self._closing and self._rows:
+            self._StartImport([row.path for row in self._rows])
 
-    def _MergeSummaries(self) -> TaskResult:
-        return TaskResult.merge(self._worker_summaries.values())
-
-    def _OnAllWorkersFinished(self, summary: TaskResult) -> None:
+    def _OnWriteTaskFinished(self, summary: TaskResult) -> None:
         if summary.cancelled:
+            self.status_label.setText("写入已取消")
             self._ShowInfoBar("写入已取消", "部分文件可能未修改", warning=True)
         elif summary.failed:
             self._ShowInfoBar(
@@ -1290,23 +1298,12 @@ class MetadataPage(QWidget):
         )
         self._UpdateLogExportButtons()
 
-    def _OnWorkerThreadFinished(self, worker: MetadataWriteWorker) -> None:
-        if worker in self._workers:
-            self._workers.remove(worker)
-        if not self._workers:
-            self._worker_summaries = {}
-            self._thread_progress = {}
-            self._UpdateControls()
-            # 写入后重新导入，让表格回到磁盘上的真实状态
-            if not self._closing and self._rows:
-                self._StartImport([row.path for row in self._rows])
+        self._UpdateControls()
 
     def _OnCancelClicked(self) -> None:
-        if self._workers:
+        if self._task_controller.request_cancel():
             self.status_label.setText("正在取消…")
             self.cancel_button.setEnabled(False)
-            for worker in self._workers:
-                worker.RequestCancel()
 
     def _OnOpenOutputDir(self) -> None:
         opened = 0
@@ -1320,7 +1317,7 @@ class MetadataPage(QWidget):
 
     # ---- 重置 ---------------------------------------------------------
     def _OnResetClicked(self) -> None:
-        if not self._rows:
+        if not self._rows or self._closing or self._task_controller.active:
             return
         for row in self._rows:
             row.edited_values.clear()
@@ -1373,11 +1370,12 @@ class MetadataPage(QWidget):
 
     # ---- 状态辅助 -----------------------------------------------------
     def _UpdateControls(self) -> None:
-        running = self._read_worker is not None or bool(self._workers)
+        running = self._task_controller.active or self._closing
         has_cover = "cover" in self._checked_fields
         self.import_files_button.setEnabled(not running)
         self.import_folder_button.setEnabled(not running)
         self.field_dropdown.setEnabled(not running)
+        self.table.setEnabled(not running)
 
         self._ShowRow(self.cover_zoom_row, has_cover)
         self.cover_zoom_label.setVisible(has_cover)
@@ -1400,7 +1398,7 @@ class MetadataPage(QWidget):
         modified_count = sum(1 for row in self._rows if row.modified)
         self.confirm_button.setEnabled(not running and modified_count > 0)
         self.reset_button.setEnabled(not running and modified_count > 0)
-        self.cancel_button.setEnabled(bool(self._workers))
+        self.cancel_button.setEnabled(self._task_controller.can_cancel and not self._closing)
         self.open_output_button.setEnabled(not running and bool(self._last_output_dirs))
         self._UpdateLogExportButtons()
 
@@ -1435,13 +1433,10 @@ class MetadataPage(QWidget):
         )
 
     def _UpdateLogExportButtons(self) -> None:
-        running = bool(self._workers)
+        running = self._task_controller.active or self._closing
         self.export_error_button.setEnabled(not running and bool(self._error_logs))
 
     # ---- 日志 ---------------------------------------------------------
-    def _OnWorkerLog(self, _thread_id: int, level: int, text: str) -> None:
-        self._AppendLog(level, text)
-
     def _AppendLog(self, level: int, text: str) -> None:
         timestamp = datetime.now().strftime("%H:%M:%S")
         body = (
@@ -1461,7 +1456,7 @@ class MetadataPage(QWidget):
         self.log_browser.ensureCursorVisible()
 
     def _ExportErrorLog(self) -> None:
-        if not self._error_logs or self._workers:
+        if not self._error_logs or self._task_controller.active or self._closing:
             return
         file_path, _filter = QFileDialog.getSaveFileName(
             self, "导出错误日志", "error_log.txt", "文本文件 (*.txt);;所有文件 (*.*)"
@@ -1478,6 +1473,8 @@ class MetadataPage(QWidget):
     def _ShowInfoBar(
         self, title: str, content: str, error: bool = False, warning: bool = False
     ) -> None:
+        if self._closing:
+            return
         info_bar = InfoBar.new
         if error:
             info_bar = InfoBar.error
@@ -1489,14 +1486,27 @@ class MetadataPage(QWidget):
 
     # ---- 生命周期 -----------------------------------------------------
     def Shutdown(self) -> None:
+        if self._closing:
+            return
         self._closing = True
-        if self._read_worker is not None:
-            self._read_worker.RequestCancel()
-            self._read_worker.wait()
-            self._read_worker = None
-        for worker in list(self._workers):
-            worker.RequestCancel()
-        for worker in list(self._workers):
-            worker.wait()
-        self._workers.clear()
-        self._cover_temp_dir.cleanup()
+        for dialog in self.findChildren(_CoverDialog):
+            dialog.idle.connect(self._TryCleanupCovers)
+            dialog.Shutdown()
+        self._task_controller.shutdown()
+        self._UpdateControls()
+        self._TryCleanupCovers()
+
+    def _TryCleanupCovers(self) -> None:
+        if (self._closing and not self._task_controller.active
+                and not any(dialog.active for dialog in self.findChildren(_CoverDialog))):
+            self._cover_temp_dir.cleanup()
+            if self._close_requested:
+                QTimer.singleShot(0, self.close)
+
+    def closeEvent(self, event) -> None:  # noqa: N802
+        self._close_requested = True
+        self.Shutdown()
+        if self._task_controller.active or any(dialog.active for dialog in self.findChildren(_CoverDialog)):
+            event.ignore()
+        else:
+            event.accept()

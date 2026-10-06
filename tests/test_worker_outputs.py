@@ -17,10 +17,8 @@ from app.ffmpeg_environment import FfmpegCapabilities
 from app.image.models import Batch, ConvertOptions
 from app.task_models import ProcessResult, TaskResult
 from app.video.models import VideoBatch, VideoCompressOptions
-from ui.AlbumWorker import AlbumWorker
-from ui.MetadataWorker import CoverExportWorker, MetadataReadWorker, MetadataWriteWorker
-from ui.VideoWorker import VideoCompressWorker
-from ui.Worker import ConvertWorker
+from ui.tasks.worker import TaskWorker
+from ui.tasks.jobs import album_job, cover_export_job, image_job, metadata_read_job, metadata_write_job, video_job
 
 
 APP = QApplication.instance() or QApplication([])
@@ -58,14 +56,14 @@ class WorkerOutputTests(unittest.TestCase):
     def image_worker(self):
         sources = [self.sample("images/song.jpg", b"jpg"), self.sample("images/song.png", b"png")]
         output = self.root / "images_output"
-        return ConvertWorker(1, [Batch(sources[0].parent, output, sources)],
-                             ConvertOptions("ffmpeg", target_extension=".webp"), CAPS), output
+        return TaskWorker(1, image_job([Batch(sources[0].parent, output, sources)],
+                                     ConvertOptions("ffmpeg", target_extension=".webp"), CAPS)), output
 
     def video_worker(self, overwrite=True):
         sources = [self.sample("videos/song.mkv", b"mkv"), self.sample("videos/song.mov", b"mov")]
         output = self.root / "videos_output"
-        return VideoCompressWorker([VideoBatch(sources[0].parent, output, sources)],
-                                   VideoCompressOptions("ffmpeg", overwrite=overwrite), CAPS), output
+        return TaskWorker(1, video_job([VideoBatch(sources[0].parent, output, sources)],
+                                     VideoCompressOptions("ffmpeg", overwrite=overwrite), CAPS)), output
 
     def album_worker(self):
         root = self.root / "albums"
@@ -74,13 +72,13 @@ class WorkerOutputTests(unittest.TestCase):
         self.sample("albums/album/artist.txt", b"Alice Bob")
         self.sample("albums/album/song.mp3", b"mp3")
         self.sample("albums/album/song.wav", b"wav")
-        return AlbumWorker(1, BuildAlbumPlan(root), True, "ffmpeg"), root / "album" / "album"
+        return TaskWorker(1, album_job(BuildAlbumPlan(root), True, "ffmpeg")), root / "album" / "album"
 
     def metadata_worker(self):
         sources = [self.sample("audio/A/song.mp3", b"A"), self.sample("audio/B/song.mp3", b"B")]
         edits = [TrackEdit(source, edited_values={"title": "new"}) for source in sources]
         output = self.root / "metadata_output"
-        return MetadataWriteWorker(1, "ffmpeg", edits, True, False, str(output)), output
+        return TaskWorker(1, metadata_write_job("ffmpeg", edits, True, False, str(output))), output
 
     def test_same_batch_image_video_album_and_metadata_outputs_do_not_overwrite_each_other(self):
         cases = [(self.image_worker, "app.converter.execute", ".webp", [b"jpg", b"png"]),
@@ -128,7 +126,7 @@ class WorkerOutputTests(unittest.TestCase):
 
                 def cancel(command, **kwargs):
                     Path(command[-1]).write_bytes(b"partial")
-                    worker.RequestCancel()
+                    worker.request_cancel()
                     return ProcessResult(0)
 
                 result = self.run_worker(worker, target, cancel)
@@ -152,7 +150,7 @@ class WorkerOutputTests(unittest.TestCase):
 
     def test_metadata_backup_failure_reports_failure_and_preserves_source(self):
         source = self.sample("track.mp3")
-        worker = MetadataWriteWorker(1, "ffmpeg", [TrackEdit(source, edited_values={"title": "new"}, backup=True)], True, True, None)
+        worker = TaskWorker(1, metadata_write_job("ffmpeg", [TrackEdit(source, edited_values={"title": "new"}, backup=True)], True, True, None))
         with patch("app.output_files.shutil.copy2", side_effect=OSError("backup failed")):
             result = self.run_worker(worker, "app.converter.execute")
         self.assertEqual((result.ok, result.failed), (0, 1))
@@ -162,14 +160,14 @@ class WorkerOutputTests(unittest.TestCase):
     def test_audio_read_and_cover_export_use_typed_task_results(self):
         source = self.sample("track.mp3")
         rows, read_results = [], []
-        worker = MetadataReadWorker(1, "ffprobe", "ffmpeg", [source])
+        worker = TaskWorker(1, metadata_read_job("ffprobe", "ffmpeg", [source]))
         worker.rowLoaded.connect(lambda _id, edit: rows.append(edit))
         worker.taskFinished.connect(lambda _id, result: read_results.append(result))
         with patch("app.audio.reader.read_audio_info", return_value=AudioInfo(source, {"title": "曲目😀"}, False, None)):
             worker.run()
         self.assertIsInstance(read_results[0], TaskResult)
         self.assertEqual(rows[0].original_values["title"], "曲目😀")
-        export = CoverExportWorker(1, "ffmpeg", [(source, "mjpeg"), (source, None)], str(self.root / "covers"))
+        export = TaskWorker(1, cover_export_job("ffmpeg", [(source, "mjpeg"), (source, None)], str(self.root / "covers")))
         result = self.run_worker(export, "app.converter.execute")
         self.assertEqual((result.ok, result.skipped), (1, 1))
         self.assertEqual(result.output_dir, str(self.root / "covers"))
