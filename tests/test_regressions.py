@@ -19,9 +19,9 @@ from PyQt6.QtWidgets import QApplication, QLabel, QVBoxLayout, QWidget
 from app.ffmpeg_environment import FfmpegCapabilities
 from app.task_models import ProcessResult
 from app.video.models import VideoBatch, VideoCompressOptions
-from ui.FfmpegService import FfmpegService
-from ui.SmoothScroll import SmoothScrollArea
-from ui.VideoPage import VideoPage
+from ui.services.ffmpeg_service import FfmpegService
+from ui.widgets.smooth_scroll import SmoothScrollArea
+from ui.video.page import VideoPage
 from ui.tasks.worker import TaskWorker
 from ui.tasks.jobs import video_job
 
@@ -63,7 +63,7 @@ class RegressionTests(unittest.TestCase):
         service = FfmpegService(self.settings)
         service.stateChanged.connect(lambda *state: states.append(state))
         try:
-            with patch("ui.FfmpegService.locate_ffmpeg", side_effect=lambda path: path), patch("ui.FfmpegService.probe_ffmpeg", side_effect=probe):
+            with patch("ui.services.ffmpeg_service.locate_ffmpeg", side_effect=lambda path: path), patch("ui.services.ffmpeg_service.probe_ffmpeg", side_effect=probe):
                 service.SetPath("old.exe")
                 WaitUntil(entered.is_set)
                 service.SetPath("new.exe")
@@ -96,10 +96,10 @@ class RegressionTests(unittest.TestCase):
         source = self.root / "source.mp4"
         source.write_bytes(b"original video")
         entered = threading.Event()
-        with patch("ui.VideoPage.QSettings", return_value=self.settings):
-            page = VideoPage()
+        page = VideoPage(settings=self.settings)
         page.SetFfmpegPath("ffmpeg.exe", CAPS)
         page._SetInputs([source])
+        WaitUntil(lambda: not page._preview_controller.active)
         summaries = []
 
         def process(command, cancel_check, **kwargs):
@@ -130,7 +130,7 @@ class RegressionTests(unittest.TestCase):
 
             with patch("app.converter.execute", side_effect=success), patch.object(page, "_ShowInfo"):
                 page._Start()
-                self.assertIn("正在压缩", page.status.text())
+                self.assertIn("正在校验输入", page.status.text())
                 WaitUntil(lambda: not page._task_controller.active)
                 self.assertIn("压缩完成", page.status.text())
                 self.assertTrue(page.start_button.isEnabled())

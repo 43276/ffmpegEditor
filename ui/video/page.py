@@ -1,47 +1,46 @@
 """视频处理主页：首期提供无损源文件保护的 MP4 批量压缩。"""
 from __future__ import annotations
 
-import html
-import os
-from datetime import datetime
 from pathlib import Path
 
-from PyQt6.QtCore import QSettings, Qt, QTimer
-from PyQt6.QtGui import QTextCursor
+from PyQt6.QtCore import Qt, QTimer
 from PyQt6.QtWidgets import QFileDialog, QHBoxLayout, QVBoxLayout, QWidget
 from qfluentwidgets import (
-    CaptionLabel, ComboBox, HeaderCardWidget, InfoBar, LineEdit, PrimaryPushButton,
-    ProgressBar, PushButton, Slider, StrongBodyLabel, TextBrowser, TitleLabel, InfoBarPosition,
+    CaptionLabel, ComboBox, InfoBar, LineEdit, PushButton, Slider, StrongBodyLabel, InfoBarPosition,
 )
-from qfluentwidgets.common.style_sheet import isDarkTheme
 
 from app.ffmpeg_environment import FfmpegCapabilities
-from app.video.planner import build_video_batches_for_inputs as BuildVideoBatchesForInputs, VideoInputError
+from app.video.planner import build_video_batches_for_inputs as BuildVideoBatchesForInputs
 from ui.media_presentation import summarize_video_batches as SummarizeVideoBatches
 from app.video.models import VideoCompressOptions
-from ui.Controls import MakeSwitchButton
-from ui.SmoothScroll import SmoothScrollArea as ScrollArea
+from ui.widgets.switch_button import MakeSwitchButton
+from ui.widgets.smooth_scroll import SmoothScrollArea as ScrollArea
 from ui.tasks.controller import TaskController, TaskState
-from ui.tasks.jobs import video_job
-from app.task_models import LOG_ERROR, LOG_INFO, LOG_OK, LOG_WARN, TaskProgress, TaskResult
-
-_LOG_COLORS = {LOG_OK: ("#0f7b0f", "#7adfa0"), LOG_WARN: ("#9a6700", "#f5c26b"), LOG_ERROR: ("#c42b1c", "#ff9aa2")}
-_LEVEL_MARKS = {LOG_OK: "✓ ", LOG_WARN: "⚠ ", LOG_ERROR: "✗ "}
-_VIDEO_FILTER = "视频文件 (*.mp4 *.m4v *.mkv *.mov *.avi *.webm *.flv *.wmv *.ts);;所有文件 (*.*)"
+from ui.tasks.preview import PreviewController, PreviewState
+from ui.widgets.log_panel import LogPanel
+from ui.widgets.task_panel import TaskPanel
+from ui.widgets.page_layout import make_card, build_page_content
+from ui.services.settings_service import SettingsService
+from ui.services.desktop_actions import DesktopActions
+from ui.tasks.jobs import video_inputs_job
+from app.task_models import LOG_ERROR, TaskProgress, TaskResult, TaskStatistics
 
 
 class VideoPage(QWidget):
     """视频压缩页；FFmpeg 可执行路径与图片、音频页面保持同步。"""
 
-    def __init__(self, parent=None):
+    def __init__(self, parent=None, *, settings=None, desktop_actions=None):
         super().__init__(parent)
         self.setObjectName("videoPage")
         self.setAcceptDrops(True)
-        self._settings = QSettings("CompressImages", "ImageConverter")
+        self._settings = settings if settings is not None else SettingsService()
         self._ffmpeg_path: str | None = None
         self._caps: FfmpegCapabilities | None = None
         self._inputs: list[Path] = []
+        self._preview_batches = None
         self._task_controller = TaskController(self)
+        self._preview_controller = PreviewController(self)
+        self._desktop_actions = desktop_actions if desktop_actions is not None else DesktopActions()
         self._closing = False
         self._close_requested = False
         self._last_output_dirs: list[str] = []
@@ -49,15 +48,8 @@ class VideoPage(QWidget):
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
         self.scroll = ScrollArea(self)
-        self.scroll.setWidgetResizable(True)
         outer.addWidget(self.scroll)
-        content = QWidget(self.scroll)
-        self.scroll.setWidget(content)
-        self.content_layout = QVBoxLayout(content)
-        self.content_layout.setContentsMargins(30, 22, 30, 26)
-        self.content_layout.setSpacing(14)
-        self.content_layout.addWidget(TitleLabel("视频压缩", content))
-        self.content_layout.addWidget(CaptionLabel("基于 FFmpeg · 批量压缩为 MP4（H.264 / H.265）· 保留源文件不修改", content))
+        _, self.content_layout = build_page_content(self.scroll, "视频压缩", "基于 FFmpeg · 批量压缩为 MP4（H.264 / H.265）· 保留源文件不修改")
         self._BuildInputCard()
         self._BuildParamsCard()
         self._BuildTaskCard()
@@ -71,16 +63,14 @@ class VideoPage(QWidget):
         self._task_controller.completed.connect(self._Finished)
         self._task_controller.stateChanged.connect(self._UpdateState)
         self._task_controller.idle.connect(self._OnTaskIdle)
+        self._preview_controller.resultReady.connect(self._OnPreviewReady)
+        self._preview_controller.errorOccurred.connect(self._OnPreviewError)
+        self._preview_controller.stateChanged.connect(self._OnPreviewState)
+        self._preview_controller.idle.connect(self._OnTaskIdle)
         self._UpdateState()
 
     def _MakeCard(self, title: str):
-        card = HeaderCardWidget(self.scroll)
-        card.setTitle(title)
-        body = QWidget(card)
-        layout = QVBoxLayout(body)
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(10)
-        card.viewLayout.addWidget(body)
+        card, layout = make_card(self.scroll, title)
         self.content_layout.addWidget(card)
         return card, layout
 
@@ -158,44 +148,26 @@ class VideoPage(QWidget):
         self.ffmpeg_status = CaptionLabel("正在等待 FFmpeg 检测…", card)
         layout.addWidget(self.ffmpeg_status)
 
-    def _BuildTaskCard(self) -> None:
-        card, layout = self._MakeCard("任务")
-        row = QHBoxLayout()
-        self.start_button = PrimaryPushButton("开始压缩", card)
-        self.cancel_button = PushButton("取消", card)
-        self.end_button = PushButton("结束", card)
-        self.end_button.setToolTip("处理完当前文件夹后停止，不再开始后续文件夹")
-        self.open_folder_button = PushButton("打开输出目录", card)
-        row.addWidget(self.start_button)
-        row.addWidget(self.cancel_button)
-        row.addWidget(self.end_button)
-        row.addWidget(self.open_folder_button)
-        row.addStretch(1)
-        layout.addLayout(row)
-        self.progress = ProgressBar(card)
-        layout.addWidget(self.progress)
-        self.status = CaptionLabel("就绪", card)
-        layout.addWidget(self.status)
+    def _BuildTaskCard(self):
+        self.task_panel = TaskPanel(self.scroll, start_text="开始压缩", finish_tooltip="处理完当前文件夹后停止，不再开始后续文件夹", show_exports=False)
+        self.content_layout.addWidget(self.task_panel)
+        for name in ("start_button", "cancel_button", "end_button", "open_folder_button"):
+            setattr(self, name, getattr(self.task_panel, name))
+        self.progress = self.task_panel.progress_bar
+        self.status = self.task_panel.status_label
 
-    def _BuildLogCard(self) -> None:
-        card, layout = self._MakeCard("处理日志")
-        clear_button = PushButton("清空", card)
-        top = QHBoxLayout()
-        self.statistics = StrongBodyLabel("总数：0    成功：0    失败：0    跳过：0", card)
-        top.addWidget(self.statistics)
-        top.addStretch(1)
-        top.addWidget(clear_button)
-        layout.addLayout(top)
-        self.log_browser = TextBrowser(card)
-        self.log_browser.setMinimumHeight(150)
-        self.log_browser.setPlaceholderText("暂无日志")
-        layout.addWidget(self.log_browser)
-        clear_button.clicked.connect(self.log_browser.clear)
+    def _BuildLogCard(self):
+        self.log_panel = LogPanel(self.scroll)
+        self.content_layout.addWidget(self.log_panel)
+        self.log_browser = self.log_panel.browser
+        self.statistics = self.log_panel.statistics_label
+        self.clear_log_button = self.log_panel.clear_button
 
     def _ConnectSignals(self) -> None:
         self.file_button.clicked.connect(self._BrowseFiles)
         self.dir_button.clicked.connect(self._BrowseDirectory)
         self.path_line.editingFinished.connect(self._SetPathFromText)
+        self.path_line.textEdited.connect(lambda _text: self._SetPathFromText())
         self.include_output_switch.checkedChanged.connect(lambda _value: self._RefreshPreview())
         self.crf_slider.valueChanged.connect(lambda value: self.crf_value.setText(str(value)))
         self.start_button.clicked.connect(self._Start)
@@ -223,27 +195,35 @@ class VideoPage(QWidget):
         if path:
             self._SetInputs([Path(path)])
 
-    def _SetPathFromText(self) -> None:
+    def _SetPathFromText(self):
+        if self.path_line.isReadOnly():
+            return
         text = self.path_line.text().strip()
-        self._SetInputs([Path(text)] if text else [])
+        self._inputs = [Path(text)] if text else []
+        self._RefreshPreview()
 
-    def _SetInputs(self, paths: list[Path]) -> None:
-        self._inputs = paths
+    def _SetInputs(self, paths: list[Path]):
+        self._inputs = list(paths)
+        self.path_line.setReadOnly(len(paths) > 1)
+        self.path_line.setClearButtonEnabled(len(paths) <= 1)
         self.path_line.setText("; ".join(str(path) for path in paths))
         self._RefreshPreview()
+
+    def _RefreshPreview(self):
+        if self._closing:
+            return
+        paths = tuple(self._inputs)
+        self._preview_batches = None
+        if not paths:
+            self._preview_controller.invalidate()
+            self.preview_label.setText("")
+            self._UpdateState()
+            return
+        include_output = self.include_output_switch.isChecked()
+        self.preview_label.setText("正在准备预览…")
+        self._preview_controller.request(lambda cancel_check: BuildVideoBatchesForInputs(paths, include_output, cancel_check=cancel_check))
         self._UpdateState()
 
-    def _RefreshPreview(self) -> None:
-        if not self._inputs:
-            self.preview_label.setText("")
-            return
-        try:
-            self.preview_label.setText(SummarizeVideoBatches(self._CurrentBatches()))
-        except VideoInputError as exc:
-            self.preview_label.setText(f"✗ {exc}")
-
-    def _CurrentBatches(self):
-        return BuildVideoBatchesForInputs(self._inputs, self.include_output_switch.isChecked())
 
     def SetFfmpegPath(self, path: str | None, capabilities: FfmpegCapabilities | None = None) -> None:
         self._ffmpeg_path = path
@@ -263,58 +243,54 @@ class VideoPage(QWidget):
         if self._caps is not None and not has_h265 and self.encoder_combo.currentData() == "libx265":
             self.encoder_combo.setCurrentIndex(0)
 
-    def _Start(self) -> None:
+    def _Start(self):
         if self._closing or self._task_controller.active:
+            return
+        if self._preview_controller.state != PreviewState.VALID or not self._preview_batches:
+            self._ShowInfo("无法开始", "输入预览尚未准备完成或输入无效", error=True)
             return
         if not self._caps or not self._ffmpeg_path:
             self._ShowInfo("无法开始", "FFmpeg 尚未就绪，请检查设置页中的 FFmpeg 路径", error=True)
-            return
-        try:
-            batches = self._CurrentBatches()
-        except VideoInputError as exc:
-            self._ShowInfo("无法开始", str(exc), error=True)
             return
         options = VideoCompressOptions(
             ffmpeg_path=self._ffmpeg_path, encoder=self.encoder_combo.currentData(),
             crf=self.crf_slider.value(), preset=self.preset_combo.currentData(),
             audio_bitrate=self.audio_combo.currentData(), overwrite=self.overwrite_switch.isChecked(),
         )
-        total = sum(len(batch.files) for batch in batches)
+        total = sum(len(batch.files) for batch in self._preview_batches)
         self._last_output_dirs = []
-        self.status.setText(f"正在压缩：0/{total}")
-        self.log_browser.clear()
-        self.progress.setRange(0, total)
+        self.status.setText("正在校验输入…")
+        self.log_panel.clear()
+        self.progress.setRange(0, max(1, total))
         self.progress.setValue(0)
         self._SetStatistics(total, 0, 0, 0)
-        self._task_controller.start(video_job(batches, options, self._caps),
-                                    total=total, supports_finish=True)
+        self._task_controller.start(video_inputs_job(tuple(self._inputs), options, self._caps, include_output_dirs=self.include_output_switch.isChecked()), total=total, supports_finish=True)
         self._UpdateState()
 
-    def _Progress(self, progress: TaskProgress) -> None:
-        self.progress.setValue(progress.done)
+    def _Progress(self, progress: TaskProgress):
         if self._task_controller.state == TaskState.RUNNING:
-            self.status.setText(f"进度 {progress.done}/{progress.total}：{progress.current_file}")
+            self.task_panel.set_progress(progress, show_file=True)
+        else:
+            self.progress.setRange(0, max(1, progress.total))
+            self.progress.setValue(progress.done)
 
     def _Finished(self, _kind: str, summary: TaskResult) -> None:
+        self.task_panel.set_result(summary, action_text="压缩")
         self._last_output_dirs = summary.output_dirs
         self._SetStatistics(summary.total, summary.ok, summary.failed, summary.skipped)
         if summary.cancelled:
-            self.status.setText("已取消")
             self._ShowInfo("任务已取消", "本次压缩已中止")
         elif summary.early_stopped:
-            self.status.setText("已结束：当前文件夹已完成")
             self._ShowInfo("已按“结束”停止", "当前文件夹已完成，后续文件夹未开始", warning=True)
         elif summary.failed:
-            self.status.setText(f"压缩完成：成功 {summary.ok}，失败 {summary.failed}，跳过 {summary.skipped}")
             self._ShowInfo("压缩完成（有失败项）", f"成功 {summary.ok}，失败 {summary.failed}，跳过 {summary.skipped}", warning=True)
         else:
-            self.status.setText(f"压缩完成：成功 {summary.ok}，跳过 {summary.skipped}")
             self._ShowInfo("压缩完成", f"成功 {summary.ok} 个视频，跳过 {summary.skipped}")
 
         self._UpdateState()
 
-    def _OnTaskIdle(self) -> None:
-        if self._close_requested:
+    def _OnTaskIdle(self):
+        if self._close_requested and not self._task_controller.active and not self._preview_controller.active:
             QTimer.singleShot(0, self.close)
 
     def _Cancel(self) -> None:
@@ -327,27 +303,18 @@ class VideoPage(QWidget):
             self.status.setText("正在处理当前文件夹，之后将停止…")
             self._UpdateState()
 
-    def _OpenOutputFolders(self) -> None:
+    def _OpenOutputFolders(self):
         for directory in self._last_output_dirs[:5]:
-            if Path(directory).is_dir():
-                os.startfile(directory)  # noqa: S606 -- explicitly requested by user button
+            try:
+                self._desktop_actions.open_output_directory(directory)
+            except OSError as exc:
+                self._AppendLog(LOG_ERROR, f"打开输出目录失败：{exc}")
 
-    def _SetStatistics(self, total: int, ok: int, failed: int, skipped: int) -> None:
-        self.statistics.setText(f"总数：{total}    成功：{ok}    失败：{failed}    跳过：{skipped}")
+    def _SetStatistics(self, total: int, ok: int, failed: int, skipped: int):
+        self.log_panel.set_statistics(TaskStatistics(total, ok, failed, skipped, ok + failed + skipped))
 
-    def _AppendLog(self, level: int, text: str) -> None:
-        timestamp = datetime.now().strftime("%H:%M:%S")
-        body = f"[{timestamp}] {_LEVEL_MARKS.get(level, '')}{html.escape(text).replace(chr(10), '<br>')}"
-        if level == LOG_INFO:
-            line = f"<div style='margin:0'>{body}</div>"
-        else:
-            light, dark = _LOG_COLORS[level]
-            line = f"<div style='margin:0;color:{dark if isDarkTheme() else light}'>{body}</div>"
-        cursor = self.log_browser.textCursor()
-        cursor.movePosition(QTextCursor.MoveOperation.End)
-        cursor.insertHtml(line)
-        self.log_browser.setTextCursor(cursor)
-        self.log_browser.ensureCursorVisible()
+    def _AppendLog(self, level: int, text: str):
+        self.log_panel.append(level, text)
 
     def _ShowInfo(self, title: str, content: str, error: bool = False, warning: bool = False) -> None:
         if self._closing:
@@ -355,14 +322,14 @@ class VideoPage(QWidget):
         method = InfoBar.error if error else InfoBar.warning if warning else InfoBar.success
         method(title=title, content=content, orient=Qt.Orientation.Horizontal, isClosable=True, position=InfoBarPosition.TOP, duration=3500, parent=self)
 
-    def _UpdateState(self) -> None:
+    def _UpdateState(self):
         running = self._task_controller.active or self._closing
-        self.start_button.setEnabled(bool(self._caps and self._inputs) and not running)
-        self.cancel_button.setEnabled(self._task_controller.can_cancel and not self._closing)
-        self.end_button.setEnabled(self._task_controller.can_finish and not self._closing)
+        ready = bool(self._caps and self._ffmpeg_path and self._preview_batches) and self._preview_controller.state == PreviewState.VALID
+        self.task_panel.update_state(self._task_controller, ready, self._closing, bool(self._last_output_dirs))
         self.file_button.setEnabled(not running)
         self.dir_button.setEnabled(not running)
-        self.open_folder_button.setEnabled(not running and bool(self._last_output_dirs))
+        self.path_line.setEnabled(not running)
+        self.include_output_switch.setEnabled(not running)
 
     def _RestoreSettings(self) -> None:
         self.include_output_switch.setChecked(self._settings.value("video/include_output", False, type=bool))
@@ -387,12 +354,29 @@ class VideoPage(QWidget):
         self._settings.setValue("video/encoder", self.encoder_combo.currentData())
         self._settings.sync()
         self._task_controller.shutdown()
+        self._preview_controller.shutdown()
         self._UpdateState()
 
     def closeEvent(self, event) -> None:  # noqa: N802
         self._close_requested = True
         self.Shutdown()
-        if self._task_controller.active:
+        if self._task_controller.active or self._preview_controller.active:
             event.ignore()
         else:
             event.accept()
+
+    def _OnPreviewReady(self, batches):
+        self._preview_batches = batches
+        self.preview_label.setText(SummarizeVideoBatches(batches))
+        self._UpdateState()
+
+    def _OnPreviewError(self, message):
+        self._preview_batches = None
+        self.preview_label.setText(f"✗ {message}")
+        self._UpdateState()
+
+    def _OnPreviewState(self, _state):
+        self._UpdateState()
+
+    def SetEnvironment(self, environment):
+        self.SetFfmpegPath(environment.ffmpeg_path, environment.capabilities)

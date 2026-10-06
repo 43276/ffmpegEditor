@@ -9,7 +9,7 @@ from .models import Batch, ConvertOptions
 from .commands import build_image_command
 from app.ffmpeg_environment import FfmpegCapabilities
 from app.errors import FfmpegError
-from app.input_paths import collect_leaf_media
+from app.input_paths import collect_leaf_media, validate_inputs, check_scan_cancelled
 from app.output_files import path_key, reserve_output_path, temporary_path_for, unique_path_for
 from app.task_models import BatchPlan, FilePlan, LogEvent, LogLevel, TaskPlan
 
@@ -29,34 +29,26 @@ def build_batches_for_inputs(
     include_output_dirs: bool = False,
     output_root: str | Path | None = None,
     multi_file_output_name: str | None = None,
+    *, cancel_check=None,
 ) -> list[Batch]:
     """把一组同类输入统一解析为批次。
 
     输入只能是文件或文件夹中的一种。多个文件必须位于同一层级，
     并作为一个批次处理；多个文件夹则各自按 A/B/C 规则处理。
     """
-    paths = [Path(path) for path in input_paths]
-    if not paths:
-        raise InputError("请先选择输入文件或文件夹")
-    missing = next((path for path in paths if not path.exists()), None)
-    if missing is not None:
-        raise InputError(f"路径不存在：{missing}")
-
+    paths = validate_inputs(input_paths, InputError,
+                            empty_message="请先选择输入文件或文件夹",
+                            same_parent_message="多选文件必须位于同一个文件夹内",
+                            cancel_check=cancel_check)
     file_flags = [path.is_file() for path in paths]
-    dir_flags = [path.is_dir() for path in paths]
-    if not all(file_flags) and not all(dir_flags):
-        raise InputError("不能同时选择文件和文件夹")
 
     if all(file_flags):
         if any(not is_picture_file(path) for path in paths):
             invalid = next(path for path in paths if not is_picture_file(path))
             raise InputError(f"不支持的文件类型：{invalid.name}")
-        parents = {path.resolve().parent for path in paths}
-        if len(parents) != 1:
-            raise InputError("多选文件必须位于同一个文件夹内")
-
         if len(paths) == 1:
-            batches = build_batches(paths[0], include_output_dirs=include_output_dirs)
+            batches = build_batches(paths[0], include_output_dirs=include_output_dirs,
+                                    cancel_check=cancel_check)
             return relocate_batch_outputs(batches, output_root) if output_root is not None else batches
 
         parent = paths[0].parent
@@ -73,14 +65,11 @@ def build_batches_for_inputs(
             )
         ]
 
-    if len(paths) > 1:
-        parents = {path.resolve().parent for path in paths}
-        if len(parents) != 1:
-            raise InputError("多选文件夹必须位于同一个上级文件夹内")
-
     batches: list[Batch] = []
     for path in paths:
-        batches.extend(build_batches(path, include_output_dirs=include_output_dirs))
+        check_scan_cancelled(cancel_check)
+        batches.extend(build_batches(path, include_output_dirs=include_output_dirs,
+                                     cancel_check=cancel_check))
     if output_root is not None:
         batches = relocate_batch_outputs(batches, output_root)
     return batches
@@ -93,13 +82,14 @@ def make_task_output_name(started_at: datetime | None = None) -> str:
 
 
 def build_batches(
-    input_path: str | Path, include_output_dirs: bool = False
+    input_path: str | Path, include_output_dirs: bool = False, *, cancel_check=None,
 ) -> list[Batch]:
     """按 A/B/C 规则把输入路径解析为处理批次；无可处理内容时抛 InputError。
 
     include_output_dirs：默认忽略已生成的 *_output 目录（防止把上次输出
     再次当作输入）；置 True 时把它们当作普通目录一并纳入处理。
     """
+    check_scan_cancelled(cancel_check)
     path = Path(input_path)
     if not path.exists():
         raise InputError(f"路径不存在：{path}")
@@ -112,7 +102,7 @@ def build_batches(
 
     if path.is_dir():
         batches: list[Batch] = []
-        _collect_batches_from_folder(path, batches, include_output_dirs)
+        _collect_batches_from_folder(path, batches, include_output_dirs, cancel_check=cancel_check)
         if not batches:
             raise InputError(f"该位置没有找到可处理的图片：{path}")
         return batches
@@ -121,10 +111,10 @@ def build_batches(
 
 
 def _collect_batches_from_folder(
-    folder: Path, batches: list[Batch], include_output_dirs: bool = False
+    folder: Path, batches: list[Batch], include_output_dirs: bool = False, *, cancel_check=None,
 ) -> None:
     for leaf, pictures in collect_leaf_media(
-        folder, is_picture_file, include_output_dirs=include_output_dirs,
+        folder, is_picture_file, include_output_dirs=include_output_dirs, cancel_check=cancel_check,
     ):
         batches.append(
             Batch(
@@ -172,6 +162,7 @@ def output_name_for(source: Path, target_extension: str | None) -> str:
 
 def build_image_task(
     batches: list[Batch], options: ConvertOptions, capabilities: FfmpegCapabilities,
+    *, cancel_check=None,
 ) -> TaskPlan:
     taken = {path_key(source) for batch in batches for source in batch.files}
     planned_batches: list[BatchPlan] = []
@@ -182,6 +173,7 @@ def build_image_task(
             output_dir = output_dir.with_name(started_name)
         files: list[FilePlan] = []
         for source in batch.files:
+            check_scan_cancelled(cancel_check)
             destination = reserve_output_path(
                 output_dir / output_name_for(source, options.target_extension), taken,
             )

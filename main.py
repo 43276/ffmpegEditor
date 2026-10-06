@@ -18,11 +18,11 @@ def main() -> int:
 
     # MSFluentWindow（Win11 Mica）构造失败时回退到 FluentWindow
     try:
-        from ui.MainWindow import MainWindow
+        from ui.main_window import MainWindow
 
         window = MainWindow()
     except Exception:  # noqa: BLE001 —— 环境不支持时降级，不让程序崩溃
-        from ui.MainWindow import FallbackMainWindow
+        from ui.main_window import FallbackMainWindow
 
         window = FallbackMainWindow()
 

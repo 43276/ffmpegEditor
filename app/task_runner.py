@@ -70,6 +70,8 @@ class TaskRunner:
             return self._skipped(result, exists_message)
         if plan.error is not None:
             return self._failed(result, f"{source}：{plan.error}")
+        if not plan.source_path.is_file():
+            return self._failed(result, f"{source}：源文件不存在或已不是文件")
 
         try:
             with output_transaction(plan):
@@ -152,6 +154,11 @@ class TaskRunner:
                 self._statistics(result)
             if result.cancelled:
                 break
+        # 最后一批也可能收到“结束”，用户停止意图必须阻止完成后关机。
+        if self._cancel_requested():
+            result.cancelled = True
+        elif self._finish_requested():
+            result.early_stopped = True
         if result.cancelled:
             self._log(LogLevel.WARN, "已取消，任务中止")
         elif result.early_stopped:

@@ -5,6 +5,7 @@ from dataclasses import replace
 from pathlib import Path
 
 from .cover_commands import build_cover_export_command, cover_suffix_for_codec
+from app.input_paths import check_scan_cancelled
 from app.output_files import path_key, temporary_path_for, unique_path_for
 from app.task_models import BatchPlan, FilePlan, TaskPlan
 
@@ -24,10 +25,12 @@ def build_cover_export_plan(
 
 def build_cover_export_task(
     ffmpeg_path: str, items: list[tuple[Path, str | None]], output_dir: str | Path,
+    *, cancel_check=None,
 ) -> TaskPlan:
     taken = {path_key(path) for path, _codec in items}
     files: list[FilePlan] = []
     for path, codec in items:
+        check_scan_cancelled(cancel_check)
         plan = build_cover_export_plan(ffmpeg_path, path, output_dir, codec, taken)
         if codec is None:
             plan = replace(plan, skip_reason="无内嵌封面，跳过")

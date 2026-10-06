@@ -6,6 +6,7 @@ from pathlib import Path
 from .formats import AUDIO_EXTENSIONS, IMAGE_EXTENSIONS
 from .models import AlbumAudioGroup, AlbumPlan, AlbumSkippedDir, AlbumTask, TrackMetadata
 from .album_commands import build_album_command
+from app.input_paths import walk_files, directory_entries, check_scan_cancelled
 from app.output_files import path_key, reserve_output_path, temporary_path_for
 from app.task_models import BatchPlan, FilePlan, LogEvent, LogLevel, TaskPlan
 
@@ -68,25 +69,27 @@ def is_in_generated_output(path: Path, processing_dir: Path) -> bool:
     return False
 
 
-def collect_recursive_audio_files(processing_dir: Path) -> list[Path]:
+def collect_recursive_audio_files(processing_dir: Path, *, cancel_check=None) -> list[Path]:
     return sorted(
         path
-        for path in processing_dir.rglob("*")
+        for path in walk_files(processing_dir, cancel_check=cancel_check,
+                               skip_dir=lambda path: path.name == processing_dir.name)
         if is_album_audio_file(path) and not is_in_generated_output(path, processing_dir)
     )
 
 
-def collect_recursive_image_files(processing_dir: Path) -> list[Path]:
+def collect_recursive_image_files(processing_dir: Path, *, cancel_check=None) -> list[Path]:
     return sorted(
         path
-        for path in processing_dir.rglob("*")
+        for path in walk_files(processing_dir, cancel_check=cancel_check,
+                               skip_dir=lambda path: path.name == processing_dir.name)
         if is_album_image_file(path) and not is_in_generated_output(path, processing_dir)
     )
 
 
-def find_processing_dirs(root_dir: Path) -> list[Path]:
+def find_processing_dirs(root_dir: Path, *, cancel_check=None) -> list[Path]:
     """根目录下的每个一级子文件夹视为一张待处理的专辑。"""
-    return sorted(path for path in root_dir.iterdir() if path.is_dir())
+    return sorted(path for path in directory_entries(root_dir, cancel_check=cancel_check) if path.is_dir())
 
 
 def group_audio_by_parent(audio_files: list[Path]) -> dict[Path, list[Path]]:
@@ -97,21 +100,23 @@ def group_audio_by_parent(audio_files: list[Path]) -> dict[Path, list[Path]]:
     return dict(sorted(grouped.items()))
 
 
-def build_album_plan(root_dir: str | Path) -> AlbumPlan:
+def build_album_plan(root_dir: str | Path, *, cancel_check=None) -> AlbumPlan:
     """扫描根目录，产出专辑批处理计划。"""
+    check_scan_cancelled(cancel_check)
     root = Path(root_dir)
     if not root.exists():
         raise FileNotFoundError(f"根目录不存在: {root}")
     if not root.is_dir():
         raise NotADirectoryError(f"不是文件夹: {root}")
 
-    processing_dirs = find_processing_dirs(root)
+    processing_dirs = find_processing_dirs(root, cancel_check=cancel_check)
     tasks: list[AlbumTask] = []
     skipped_dirs: list[AlbumSkippedDir] = []
 
     for processing_dir in processing_dirs:
-        audio_files = collect_recursive_audio_files(processing_dir)
-        image_files = collect_recursive_image_files(processing_dir)
+        check_scan_cancelled(cancel_check)
+        audio_files = collect_recursive_audio_files(processing_dir, cancel_check=cancel_check)
+        image_files = collect_recursive_image_files(processing_dir, cancel_check=cancel_check)
 
         if not audio_files:
             skipped_dirs.append(AlbumSkippedDir(processing_dir, "没有找到音频文件"))
@@ -155,13 +160,14 @@ def build_album_plan(root_dir: str | Path) -> AlbumPlan:
     return AlbumPlan(tasks=tasks, skipped_dirs=skipped_dirs)
 
 
-def build_album_task(plan: AlbumPlan, ffmpeg_path: str, overwrite: bool) -> TaskPlan:
+def build_album_task(plan: AlbumPlan, ffmpeg_path: str, overwrite: bool, *, cancel_check=None) -> TaskPlan:
     taken = {path_key(source) for task in plan.tasks for group in task.groups for source in group.files}
     batches: list[BatchPlan] = []
     for task in plan.tasks:
         files: list[FilePlan] = []
         for group in task.groups:
             for source in group.files:
+                check_scan_cancelled(cancel_check)
                 destination = reserve_output_path(
                     output_path_for(group.audio_dir, group.output_dir, source), taken,
                 )

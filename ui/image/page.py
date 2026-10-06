@@ -1,16 +1,11 @@
 """图片处理页面：输入、转换任务、日志及图片页偏好。"""
 from __future__ import annotations
 
-import html
 import json
-import os
-import subprocess
-import sys
-from datetime import datetime
+from subprocess import TimeoutExpired
 from pathlib import Path
 
-from PyQt6.QtCore import QSettings, Qt, QTimer
-from PyQt6.QtGui import QTextCursor
+from PyQt6.QtCore import Qt, QTimer
 from PyQt6.QtWidgets import (
     QButtonGroup,
     QFileDialog,
@@ -23,64 +18,57 @@ from PyQt6.QtWidgets import (
 from qfluentwidgets import (
     CaptionLabel,
     ComboBox,
-    HeaderCardWidget,
     InfoBar,
     LineEdit,
-    PrimaryPushButton,
-    ProgressBar,
     PushButton,
     RadioButton,
     Slider,
     SpinBox,
     StrongBodyLabel,
-    TextBrowser,
-    TitleLabel,
 )
-from qfluentwidgets.common.style_sheet import isDarkTheme
 
 from app.ffmpeg_environment import FfmpegCapabilities
 from app.image.commands import supports_image_format
 from app.image.planner import (
     build_batches_for_inputs as BuildBatchesForInputs, InputError,
-    make_task_output_name as MakeTaskOutputName,
 )
 from app.image.formats import is_lossless_extension as IsLosslessExtension
 from ui.media_presentation import summarize_image_batches as SummarizeBatches, TARGET_FORMAT_OPTIONS
 from app.image.models import ConvertOptions
-from ui.Controls import MakeSwitchButton
-from ui.SmoothScroll import SmoothScrollArea as ScrollArea
-from app.task_models import LOG_ERROR, LOG_INFO, LOG_OK, LOG_WARN, TaskProgress, TaskResult, TaskStatistics
+from ui.widgets.switch_button import MakeSwitchButton
+from ui.widgets.smooth_scroll import SmoothScrollArea as ScrollArea
+from app.task_models import LOG_ERROR, LOG_INFO, LOG_WARN, TaskProgress, TaskResult, TaskStatistics
 from ui.tasks.controller import TaskController, TaskState
-from ui.tasks.jobs import image_job
-
-# 深浅主题下的日志颜色
-_LOG_COLORS = {
-    LOG_OK: ("#0f7b0f", "#7adfa0"),
-    LOG_WARN: ("#9a6700", "#f5c26b"),
-    LOG_ERROR: ("#c42b1c", "#ff9aa2"),
-}
-_LEVEL_MARKS = {LOG_OK: "✓ ", LOG_WARN: "⚠ ", LOG_ERROR: "✗ "}
+from ui.tasks.preview import PreviewController, PreviewState
+from ui.widgets.log_panel import LogPanel
+from ui.widgets.task_panel import TaskPanel
+from ui.widgets.page_layout import make_card, build_page_content
+from ui.services.settings_service import SettingsService
+from ui.services.desktop_actions import DesktopActions
+from ui.tasks.jobs import image_inputs_job
 
 
 class ImagePage(QWidget):
     """独立的图片处理页面；共享 FFmpeg 状态由主窗口提供。"""
 
     # ---- 初始化 -------------------------------------------------------
-    def __init__(self, parent=None):
+    def __init__(self, parent=None, *, settings=None, desktop_actions=None):
         super().__init__(parent)
         self.setObjectName("imagePage")
         self.setAcceptDrops(True)
 
-        self._settings = QSettings("CompressImages", "ImageConverter")
+        self._settings = settings if settings is not None else SettingsService()
         self._caps: FfmpegCapabilities | None = None
         self._active_ffmpeg_path: str | None = None
         self._task_controller = TaskController(self)
+        self._preview_controller = PreviewController(self)
+        self._desktop_actions = desktop_actions if desktop_actions is not None else DesktopActions()
         self._input_paths: list[Path] = []
         self._preview_batches = None
+        self._shutdown_requested = False
         self._last_output_dirs: list[str] = []
         self._error_logs: list[str] = []
         self._skipped_logs: list[str] = []
-        self._live_statistics = {"total": 0, "ok": 0, "failed": 0, "skipped": 0}
         self._closing = False
         self._close_requested = False
 
@@ -100,6 +88,10 @@ class ImagePage(QWidget):
         self._task_controller.completed.connect(self._OnTaskFinished)
         self._task_controller.stateChanged.connect(self._UpdateStartState)
         self._task_controller.idle.connect(self._OnTaskIdle)
+        self._preview_controller.resultReady.connect(self._OnPreviewReady)
+        self._preview_controller.errorOccurred.connect(self._OnPreviewError)
+        self._preview_controller.stateChanged.connect(self._OnPreviewState)
+        self._preview_controller.idle.connect(self._OnTaskIdle)
 
         self.home_interface.setObjectName("homeInterface")
 
@@ -109,34 +101,17 @@ class ImagePage(QWidget):
         self._UpdateQualityUi()
         self._UpdateStartState()
 
-    def _BuildScrollContent(self) -> None:
+    def _BuildScrollContent(self):
         self.home_interface = ScrollArea(self)
-        self.home_interface.setWidgetResizable(True)
-        content = QWidget(self.home_interface)
-        content.setObjectName("homeContent")
-        self.home_interface.setWidget(content)
-
-        self.content_layout = QVBoxLayout(content)
-        self.content_layout.setContentsMargins(30, 22, 30, 26)
-        self.content_layout.setSpacing(14)
-
-        header_title = TitleLabel("图片压缩与格式转换", content)
-        header_caption = CaptionLabel(
+        _, self.content_layout = build_page_content(
+            self.home_interface, "图片压缩与格式转换",
             "基于 FFmpeg · 支持 JPG / PNG / WebP / GIF / AVIF / BMP / TIFF · 单文件或文件夹批量处理",
-            content,
+            object_name="homeContent",
         )
-        self.content_layout.addWidget(header_title)
-        self.content_layout.addWidget(header_caption)
 
-    def _MakeCard(self, title: str) -> tuple[HeaderCardWidget, QVBoxLayout]:
-        card = HeaderCardWidget(self.home_interface)
-        card.setTitle(title)
-        body = QWidget(card)
-        body_layout = QVBoxLayout(body)
-        body_layout.setContentsMargins(0, 0, 0, 0)
-        body_layout.setSpacing(10)
-        card.viewLayout.addWidget(body)
-        return card, body_layout
+    def _MakeCard(self, title: str):
+        card, layout = make_card(self.home_interface, title)
+        return card, layout
 
     def _BuildInputCard(self) -> None:
         card, layout = self._MakeCard("输入")
@@ -271,69 +246,25 @@ class ImagePage(QWidget):
         label.setFixedWidth(88)
         return label
 
-    def _BuildActionCard(self) -> None:
-        card, layout = self._MakeCard("任务")
-        self.content_layout.addWidget(card)
-
-        button_row = QHBoxLayout()
-        self.start_button = PrimaryPushButton("开始处理", card)
-        self.cancel_button = PushButton("取消", card)
-        self.end_button = PushButton("结束", card)
-        self.end_button.setToolTip("处理完当前正在处理的文件夹后停止，不再开始新的文件夹")
-        self.open_folder_button = PushButton("打开输出目录", card)
-        self.export_error_button = PushButton("导出错误日志", card)
-        self.export_skipped_button = PushButton("导出跳过日志", card)
-        button_row.addWidget(self.start_button)
-        button_row.addWidget(self.cancel_button)
-        button_row.addWidget(self.end_button)
-        button_row.addWidget(self.open_folder_button)
-        button_row.addWidget(self.export_error_button)
-        button_row.addWidget(self.export_skipped_button)
-        button_row.addStretch(1)
-        layout.addLayout(button_row)
-
-        self.progress_bar = ProgressBar(card)
-        self.progress_bar.setRange(0, 100)
-        self.progress_bar.setValue(0)
-        layout.addWidget(self.progress_bar)
-
-        self.status_label = CaptionLabel("就绪", card)
-        layout.addWidget(self.status_label)
-
-        # 任务完成后的自动关机选项（默认关闭，避免误触）
+    def _BuildActionCard(self):
+        self.task_panel = TaskPanel(self.home_interface, finish_tooltip="处理完当前正在处理的文件夹后停止，不再开始新的文件夹")
+        self.content_layout.addWidget(self.task_panel)
+        for name in ("start_button", "cancel_button", "end_button", "open_folder_button", "export_error_button", "export_skipped_button", "progress_bar", "status_label"):
+            setattr(self, name, getattr(self.task_panel, name))
         shutdown_row = QHBoxLayout()
-        self.auto_shutdown_switch = MakeSwitchButton("任务完成后自动关机", card)
+        self.auto_shutdown_switch = MakeSwitchButton("任务完成后自动关机", self.task_panel)
         self.auto_shutdown_switch.setChecked(False)
-        shutdown_hint = CaptionLabel("仅 Windows · 全部结束后 60 秒倒计时关机，可在系统提示中取消（shutdown /a）", card)
         shutdown_row.addWidget(self.auto_shutdown_switch)
         shutdown_row.addSpacing(8)
-        shutdown_row.addWidget(shutdown_hint, 1)
-        shutdown_row.addStretch(0)
-        layout.addLayout(shutdown_row)
+        shutdown_row.addWidget(CaptionLabel("仅 Windows · 全部结束后 60 秒倒计时关机，可在系统提示中取消（shutdown /a）", self.task_panel), 1)
+        self.task_panel.body_layout.addLayout(shutdown_row)
 
-    def _BuildLogCard(self) -> None:
-        card, layout = self._MakeCard("处理日志")
-        self.content_layout.addWidget(card)
-
-        top_row = QHBoxLayout()
-        self.log_statistics_label = StrongBodyLabel("总数：0    成功：0    失败：0    跳过：0", card)
-        top_hint = CaptionLabel("转换过程与 ffmpeg 输出", card)
-        clear_button = PushButton("清空", card)
-        clear_button.setFixedWidth(72)
-        top_row.addWidget(self.log_statistics_label)
-        top_row.addSpacing(16)
-        top_row.addWidget(top_hint)
-        top_row.addStretch(1)
-        top_row.addWidget(clear_button)
-        layout.addLayout(top_row)
-
-        self.log_browser = TextBrowser(card)
-        self.log_browser.setMinimumHeight(150)
-        self.log_browser.setPlaceholderText("暂无日志")
-        layout.addWidget(self.log_browser, 1)
-
-        self.clear_log_button = clear_button
-        self._UpdateLogExportButtons()
+    def _BuildLogCard(self):
+        self.log_panel = LogPanel(self.home_interface)
+        self.content_layout.addWidget(self.log_panel)
+        self.log_browser = self.log_panel.browser
+        self.log_statistics_label = self.log_panel.statistics_label
+        self.clear_log_button = self.log_panel.clear_button
 
     def _ConnectSignals(self) -> None:
         self.browse_file_button.clicked.connect(self._OnBrowseFile)
@@ -342,6 +273,7 @@ class ImagePage(QWidget):
         self.path_line.editingFinished.connect(self._OnPathEdited)
         self.path_line.textEdited.connect(self._OnPathTextEdited)
         self.output_root_line.editingFinished.connect(self._RefreshPreview)
+        self.output_root_line.textEdited.connect(lambda _text: self._RefreshPreview())
         self.auto_radio.toggled.connect(lambda _checked: self._OnOutputModeChanged())
         self.custom_radio.toggled.connect(lambda _checked: self._OnOutputModeChanged())
         self.format_combo.currentIndexChanged.connect(lambda _i: self._UpdateQualityUi())
@@ -352,7 +284,6 @@ class ImagePage(QWidget):
         self.open_folder_button.clicked.connect(self._OnOpenFolder)
         self.export_error_button.clicked.connect(self._ExportErrorLog)
         self.export_skipped_button.clicked.connect(self._ExportSkippedLog)
-        self.clear_log_button.clicked.connect(self.log_browser.clear)
         self.include_output_switch.checkedChanged.connect(lambda _checked: self._RefreshPreview())
 
     # ---- 拖放 ---------------------------------------------------------
@@ -390,52 +321,12 @@ class ImagePage(QWidget):
     def _SetInputPath(self, path_text: str) -> None:
         self._SetInputPaths([Path(path_text)])
 
-    def _SetInputPaths(self, paths: list[Path]) -> None:
-        """设置输入选择，并拒绝文件/文件夹混选及跨目录多文件。"""
-        unique_paths: list[Path] = []
-        seen: set[str] = set()
-        for path in paths:
-            key = str(path.resolve()).lower()
-            if key not in seen:
-                seen.add(key)
-                unique_paths.append(path)
-        if not unique_paths:
-            self._input_paths = []
-            self.path_line.setReadOnly(False)
-            self.path_line.setClearButtonEnabled(True)
-            self.path_line.clear()
-            self._RefreshPreview()
-            return
-
-        existing_files = [path for path in unique_paths if path.is_file()]
-        existing_dirs = [path for path in unique_paths if path.is_dir()]
-        if existing_files and existing_dirs:
-            self._ShowInfoBar("选择无效", "不能同时选择文件和文件夹", error=True)
-            return
-        if len(existing_files) > 1:
-            parents = {path.resolve().parent for path in existing_files}
-            if len(parents) != 1:
-                self._ShowInfoBar("选择无效", "多选文件必须位于同一个文件夹内", error=True)
-                return
-        if len(existing_dirs) > 1:
-            parents = {path.resolve().parent for path in existing_dirs}
-            if len(parents) != 1:
-                self._ShowInfoBar("选择无效", "多选文件夹必须位于同一个上级文件夹内", error=True)
-                return
-
-        self._input_paths = unique_paths
-        self.path_line.setReadOnly(len(unique_paths) > 1)
-        self.path_line.setClearButtonEnabled(len(unique_paths) == 1)
-        if len(unique_paths) == 1:
-            self.path_line.setText(str(unique_paths[0]))
-        elif all(path.is_file() for path in unique_paths):
-            self.path_line.setText(
-                f"已选择 {len(unique_paths)} 个文件：{unique_paths[0].parent}"
-            )
-        else:
-            self.path_line.setText(f"已选择 {len(unique_paths)} 个文件夹")
+    def _SetInputPaths(self, paths: list[Path]):
+        self._input_paths = list(paths)
+        self.path_line.setReadOnly(len(paths) > 1)
+        self.path_line.setClearButtonEnabled(len(paths) <= 1)
+        self.path_line.setText(str(paths[0]) if len(paths) == 1 else f"已选择 {len(paths)} 个输入" if paths else "")
         self._RefreshPreview()
-        self._UpdateStartState()
 
     def _OnPathEdited(self) -> None:
         if self.path_line.isReadOnly():
@@ -446,9 +337,10 @@ class ImagePage(QWidget):
         self._RefreshPreview()
         self._UpdateStartState()
 
-    def _OnPathTextEdited(self, text: str) -> None:
+    def _OnPathTextEdited(self, text: str):
         if not self.path_line.isReadOnly():
             self._input_paths = [Path(text.strip())] if text.strip() else []
+            self._RefreshPreview()
 
     def _CurrentInputPaths(self) -> list[Path]:
         if self._input_paths:
@@ -456,33 +348,26 @@ class ImagePage(QWidget):
         text = self.path_line.text().strip()
         return [Path(text)] if text else []
 
-    def _BuildCurrentBatches(self, task_output_name: str | None = None):
-        paths = self._CurrentInputPaths()
-        output_root = self.output_root_line.text().strip() if self.custom_radio.isChecked() else None
-        return BuildBatchesForInputs(
-            paths,
-            include_output_dirs=self.include_output_switch.isChecked(),
-            output_root=output_root,
-            multi_file_output_name=task_output_name,
-        )
 
-    def _RefreshPreview(self) -> None:
-        if not self._CurrentInputPaths():
-            self.preview_label.setText("")
-            self._preview_batches = None
+    def _RefreshPreview(self):
+        if self._closing:
             return
-        try:
-            if self.custom_radio.isChecked() and not self.output_root_line.text().strip():
-                self._preview_batches = None
-                self.preview_label.setText("⚠ 已选择“指定输出目录”，请先填写输出目录路径")
-                self._UpdateStartState()
-                return
-            batches = self._BuildCurrentBatches()
-            self._preview_batches = batches
-            self.preview_label.setText(SummarizeBatches(batches))
-        except InputError as exc:
-            self._preview_batches = None
-            self.preview_label.setText(f"⚠ {exc}")
+        paths = tuple(self._CurrentInputPaths())
+        self._preview_batches = None
+        if not paths:
+            self._preview_controller.invalidate()
+            self.preview_label.setText("")
+            self._UpdateStartState()
+            return
+        output_root = self.output_root_line.text().strip() if self.custom_radio.isChecked() else None
+        custom = self.custom_radio.isChecked()
+        include_output = self.include_output_switch.isChecked()
+        def plan(cancel_check):
+            if custom and not output_root:
+                raise InputError("已选择“指定输出目录”，请先填写输出目录路径")
+            return BuildBatchesForInputs(paths, include_output_dirs=include_output, output_root=output_root, cancel_check=cancel_check)
+        self.preview_label.setText("正在准备预览…")
+        self._preview_controller.request(plan)
         self._UpdateStartState()
 
     # ---- 输出位置 -----------------------------------------------------
@@ -565,72 +450,52 @@ class ImagePage(QWidget):
         self.quality_value_label.setText(str(value))
 
     # ---- 任务执行 -----------------------------------------------------
-    def _OnStartClicked(self) -> None:
+    def _OnStartClicked(self):
         if self._closing or self._task_controller.active:
             return
-        paths = self._CurrentInputPaths()
-        if not paths:
-            self._ShowInfoBar("无法开始", "请先选择输入文件或文件夹", error=True)
+        if self._preview_controller.state != PreviewState.VALID or not self._preview_batches:
+            self._ShowInfoBar("无法开始", "输入预览尚未准备完成或输入无效", error=True)
             return
         if self._caps is None:
             self._ShowInfoBar("无法开始", "ffmpeg 尚未就绪，请检查 ffmpeg 路径", error=True)
             return
-
-        try:
-            if self.custom_radio.isChecked() and not self.output_root_line.text().strip():
-                self._ShowInfoBar("无法开始", "请先指定输出目录", error=True)
-                return
-            task_output_name = MakeTaskOutputName() if len(paths) > 1 and all(path.is_file() for path in paths) else None
-            batches = self._BuildCurrentBatches(task_output_name=task_output_name)
-        except InputError as exc:
-            self._ShowInfoBar("无法开始", str(exc), error=True)
-            return
-
-        target = self.format_combo.currentData()
-        quality = self.quality_slider.value() if self.quality_slider.isEnabled() else None
+        paths = tuple(self._CurrentInputPaths())
+        output_root = self.output_root_line.text().strip() if self.custom_radio.isChecked() else None
         options = ConvertOptions(
-            ffmpeg_path=self._active_ffmpeg_path or "",
-            target_extension=target,
-            quality=quality,
-            max_dimension=self.dimension_spin.value(),
-            overwrite=self.overwrite_switch.isChecked(),
+            ffmpeg_path=self._active_ffmpeg_path or "", target_extension=self.format_combo.currentData(),
+            quality=self.quality_slider.value() if self.quality_slider.isEnabled() else None,
+            max_dimension=self.dimension_spin.value(), overwrite=self.overwrite_switch.isChecked(),
         )
-
-        self.log_browser.clear()
+        self._shutdown_requested = self.auto_shutdown_switch.isChecked()
+        self.log_panel.clear()
         self._error_logs = []
         self._skipped_logs = []
         self._last_output_dirs = []
-        self.open_folder_button.setEnabled(False)
-
-        total = sum(len(batch.files) for batch in batches)
-        self._SetStatistics(total=total, ok=0, failed=0, skipped=0)
-        self.progress_bar.setRange(0, total)
+        total = sum(len(batch.files) for batch in self._preview_batches)
+        self._SetStatistics(total, 0, 0, 0)
+        self.progress_bar.setRange(0, max(1, total))
         self.progress_bar.setValue(0)
-
-        self._AppendLog(
-            LOG_INFO,
-            f"任务开始：{len(batches)} 个批次、{total} 个文件，"
-            "由后台线程顺序处理",
-        )
-        self.status_label.setText(f"正在处理：0/{total}")
-        self._task_controller.start(image_job(batches, options, self._caps),
-                                    total=total, supports_finish=True)
+        self._AppendLog(LOG_INFO, "任务开始：后台重新校验输入并顺序处理")
+        self.status_label.setText("正在校验输入…")
+        self._task_controller.start(image_inputs_job(paths, options, self._caps, include_output_dirs=self.include_output_switch.isChecked(), output_root=output_root), total=total, supports_finish=True)
         self._UpdateStartState()
 
-    def _OnTaskProgress(self, progress: TaskProgress) -> None:
-        self.progress_bar.setValue(progress.done)
+    def _OnTaskProgress(self, progress: TaskProgress):
         if self._task_controller.state == TaskState.RUNNING:
-            self.status_label.setText(f"进度 {progress.done}/{progress.total}")
+            self.task_panel.set_progress(progress)
+        else:
+            self.progress_bar.setRange(0, max(1, progress.total))
+            self.progress_bar.setValue(progress.done)
 
     def _OnTaskStatistics(self, stats: TaskStatistics) -> None:
         self._SetStatistics(stats.total, stats.ok, stats.failed, stats.skipped)
 
     def _OnTaskFinished(self, _kind: str, summary: TaskResult) -> None:
+        self._last_result = summary
+        self.task_panel.set_result(summary)
         if summary.cancelled:
-            self.status_label.setText("已取消")
             self._ShowInfoBar("任务已取消", "本次处理被手动中止", error=False, warning=True)
         elif summary.early_stopped:
-            self.status_label.setText("已结束：当前文件夹已完成")
             self._ShowInfoBar(
                 "已按“结束”停止",
                 f"完成当前文件夹后停止：成功 {summary.ok}，失败 {summary.failed}，"
@@ -638,14 +503,12 @@ class ImagePage(QWidget):
                 warning=True,
             )
         elif summary.failed:
-            self.status_label.setText(f"处理完成：成功 {summary.ok}，失败 {summary.failed}，跳过 {summary.skipped}")
             self._ShowInfoBar(
                 "处理完成（有失败项）",
                 f"成功 {summary.ok}，失败 {summary.failed}，跳过 {summary.skipped}",
                 warning=True,
             )
         else:
-            self.status_label.setText(f"处理完成：成功 {summary.ok}，跳过 {summary.skipped}")
             self._ShowInfoBar(
                 "处理完成",
                 f"成功 {summary.ok} 个文件，跳过 {summary.skipped}",
@@ -666,86 +529,54 @@ class ImagePage(QWidget):
             not self._closing
             and not summary.cancelled
             and not summary.early_stopped
-            and self.auto_shutdown_switch.isChecked()
+            and self._shutdown_requested
         ):
             self._ScheduleShutdown()
         self._UpdateStartState()
 
-    def _ScheduleShutdown(self) -> None:
-        """任务全部结束后执行系统关机：60 秒倒计时，可用 shutdown /a 取消。"""
-        if sys.platform != "win32":
-            self._AppendLog(LOG_WARN, "自动关机仅支持 Windows 系统，已跳过")
-            return
-        self._AppendLog(
-            LOG_WARN,
-            "所有任务已完成，系统将在 60 秒后关机；如需取消请尽快执行 shutdown /a",
-        )
+    def _ScheduleShutdown(self):
         try:
-            # 不携带 /f：给系统与其它程序优雅退出的机会
-            subprocess.run(
-                ["shutdown", "/s", "/t", "60"], check=False, timeout=10,
-                creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
-            )
-        except OSError as exc:
+            if self._desktop_actions.schedule_shutdown(self._last_result, self._shutdown_requested):
+                self._AppendLog(LOG_WARN, "所有任务已完成，系统将在 60 秒后关机；如需取消请尽快执行 shutdown /a")
+        except (OSError, TimeoutError, TimeoutExpired) as exc:
             self._AppendLog(LOG_ERROR, f"自动关机命令执行失败：{exc}")
 
-    def _OnTaskIdle(self) -> None:
-        if self._close_requested:
+    def _OnTaskIdle(self):
+        if self._close_requested and not self._task_controller.active and not self._preview_controller.active:
             QTimer.singleShot(0, self.close)
 
     def _OnCancelClicked(self) -> None:
         if self._task_controller.request_cancel():
             self.status_label.setText("正在取消…")
-            self.cancel_button.setEnabled(False)
-            self.end_button.setEnabled(False)
+            self._UpdateStartState()
 
     def _OnEndClicked(self) -> None:
         """结束：处理完当前正在处理的文件夹后停止，不再开始新文件夹。"""
         if self._task_controller.request_finish_after_current_batch():
             self.status_label.setText("正在处理当前文件夹，之后将停止…")
-            self.end_button.setEnabled(False)
+            self._UpdateStartState()
 
-    def _OnOpenFolder(self) -> None:
-        opened = 0
-        for directory in self._last_output_dirs:
-            if opened >= 5:
+    def _OnOpenFolder(self):
+        for index, directory in enumerate(self._last_output_dirs):
+            if index >= 5:
                 self._AppendLog(LOG_WARN, "输出目录较多，已打开前 5 个")
                 break
-            if Path(directory).is_dir():
-                os.startfile(directory)  # noqa: S606 —— 打开资源管理器是用户显式动作
-                opened += 1
+            try:
+                self._desktop_actions.open_output_directory(directory)
+            except OSError as exc:
+                self._AppendLog(LOG_ERROR, f"打开输出目录失败：{exc}")
 
     # ---- 状态辅助 -----------------------------------------------------
-    def _SetStatistics(self, total: int, ok: int, failed: int, skipped: int) -> None:
-        self._live_statistics = {
-            "total": total,
-            "ok": ok,
-            "failed": failed,
-            "skipped": skipped,
-        }
-        self.log_statistics_label.setText(
-            f"总数：{total}    成功：{ok}    失败：{failed}    跳过：{skipped}"
-        )
+    def _SetStatistics(self, total: int, ok: int, failed: int, skipped: int):
+        stats = TaskStatistics(total, ok, failed, skipped, ok + failed + skipped)
+        self.log_panel.set_statistics(stats)
 
-    def _UpdateLogExportButtons(self) -> None:
-        running = self._task_controller.active or self._closing
-        self.export_error_button.setEnabled(not running and bool(self._error_logs))
-        self.export_skipped_button.setEnabled(not running and bool(self._skipped_logs))
+    def _UpdateLogExportButtons(self):
+        self._UpdateStartState()
 
-    def _ExportLog(self, title: str, default_name: str, entries: list[str]) -> None:
-        if not entries or self._task_controller.active or self._closing:
-            return
-        file_path, _filter = QFileDialog.getSaveFileName(
-            self, title, default_name, "文本文件 (*.txt);;所有文件 (*.*)"
-        )
-        if not file_path:
-            return
-        try:
-            Path(file_path).write_text("\n".join(entries) + "\n", encoding="utf-8")
-        except OSError as exc:
-            self._ShowInfoBar("导出失败", str(exc), error=True)
-            return
-        self._ShowInfoBar("导出成功", f"日志已保存到：{file_path}")
+    def _ExportLog(self, title: str, default_name: str, entries: list[str]):
+        if not self._task_controller.active and not self._closing:
+            self.log_panel.export_entries(self, title, default_name, entries, self._ShowInfoBar)
 
     def _ExportErrorLog(self) -> None:
         self._ExportLog("导出错误日志", "error_log.txt", self._error_logs)
@@ -753,16 +584,18 @@ class ImagePage(QWidget):
     def _ExportSkippedLog(self) -> None:
         self._ExportLog("导出跳过日志", "skipped_log.txt", self._skipped_logs)
 
-    def _UpdateStartState(self) -> None:
-        has_path = bool(self._CurrentInputPaths())
+    def _UpdateStartState(self):
         running = self._task_controller.active or self._closing
-        self.start_button.setEnabled(self._caps is not None and has_path and not running)
-        self.cancel_button.setEnabled(self._task_controller.can_cancel and not self._closing)
-        self.end_button.setEnabled(self._task_controller.can_finish and not self._closing)
-        self.open_folder_button.setEnabled(not running and bool(self._last_output_dirs))
+        ready = self._caps is not None and self._preview_controller.state == PreviewState.VALID and bool(self._preview_batches)
+        self.task_panel.update_state(self._task_controller, ready, self._closing, bool(self._last_output_dirs), bool(self._error_logs), bool(self._skipped_logs))
         self.browse_file_button.setEnabled(not running)
         self.browse_dir_button.setEnabled(not running)
-        self._UpdateLogExportButtons()
+        self.path_line.setEnabled(not running)
+        self.include_output_switch.setEnabled(not running)
+        self.auto_radio.setEnabled(not running)
+        self.custom_radio.setEnabled(not running)
+        self.output_root_line.setEnabled(not running and self.custom_radio.isChecked())
+        self.browse_root_button.setEnabled(not running and self.custom_radio.isChecked())
 
     def _RestoreSettings(self) -> None:
         saved_inputs = self._settings.value("input/paths", "", type=str)
@@ -818,30 +651,19 @@ class ImagePage(QWidget):
         self._SaveSettings()
 
         self._task_controller.shutdown()
+        self._preview_controller.shutdown()
         self._UpdateStartState()
 
     def closeEvent(self, event) -> None:  # noqa: N802 —— Qt 事件
         self._close_requested = True
         self.Shutdown()
-        if self._task_controller.active:
+        if self._task_controller.active or self._preview_controller.active:
             event.ignore()
         else:
             event.accept()
 
-    def _AppendLog(self, level: int, text: str) -> None:
-        timestamp = datetime.now().strftime("%H:%M:%S")
-        body = f"[{timestamp}] {_LEVEL_MARKS.get(level, '')}{html.escape(text).replace(chr(10), '<br>')}"
-        if level == LOG_INFO:
-            line = f"<div style='margin:0'>{body}</div>"
-        else:
-            light, dark = _LOG_COLORS[level]
-            color = dark if isDarkTheme() else light
-            line = f"<div style='margin:0;color:{color}'>{body}</div>"
-        cursor = self.log_browser.textCursor()
-        cursor.movePosition(QTextCursor.MoveOperation.End)
-        cursor.insertHtml(line)
-        self.log_browser.setTextCursor(cursor)
-        self.log_browser.ensureCursorVisible()
+    def _AppendLog(self, level: int, text: str):
+        self.log_panel.append(level, text)
 
     def _ShowInfoBar(
         self,
@@ -860,3 +682,19 @@ class ImagePage(QWidget):
         else:
             info_bar = InfoBar.success
         info_bar(title, content, parent=self)
+
+    def _OnPreviewReady(self, batches):
+        self._preview_batches = batches
+        self.preview_label.setText(SummarizeBatches(batches))
+        self._UpdateStartState()
+
+    def _OnPreviewError(self, message):
+        self._preview_batches = None
+        self.preview_label.setText(f"⚠ {message}")
+        self._UpdateStartState()
+
+    def _OnPreviewState(self, _state):
+        self._UpdateStartState()
+
+    def SetEnvironment(self, environment):
+        self.SetFfmpegPath(environment.ffmpeg_path, environment.capabilities, environment.message)

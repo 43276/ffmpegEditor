@@ -1,6 +1,7 @@
 """管理单个活动任务；仅在线程真实结束后释放引用并允许重启。"""
 from __future__ import annotations
 
+from dataclasses import replace
 from enum import Enum
 
 from PyQt6.QtCore import QObject, Qt, pyqtSignal, pyqtSlot
@@ -117,6 +118,11 @@ class TaskController(QObject):
     @pyqtSlot(int, object)
     def _on_result(self, task_id: int, result: TaskResult) -> None:
         if self._accepts(task_id):
+            # Worker 发出结果与 GUI 消费信号之间仍可收到有效停止请求。
+            if self._state == TaskState.CANCELLING:
+                result = replace(result, cancelled=True)
+            elif self._state == TaskState.FINISHING and not result.cancelled:
+                result = replace(result, early_stopped=True)
             self._result = result
             self._set_state(TaskState.FINALIZING)
             self.resultReady.emit(result)

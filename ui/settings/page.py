@@ -1,19 +1,21 @@
 """共享 FFmpeg 路径、自定义背景与滚动说明。"""
 from __future__ import annotations
 
-from PyQt6.QtCore import QSettings, Qt, QTimer, pyqtSignal
+from PyQt6.QtCore import Qt, QTimer, pyqtSignal
 from PyQt6.QtGui import QImageReader
 from PyQt6.QtWidgets import QFileDialog, QHBoxLayout, QVBoxLayout, QWidget
-from qfluentwidgets import CaptionLabel, HeaderCardWidget, InfoBar, LineEdit, PushButton, Slider, StrongBodyLabel, TitleLabel
+from qfluentwidgets import CaptionLabel, InfoBar, LineEdit, PushButton, Slider, StrongBodyLabel
 
-from ui.SmoothScroll import SmoothScrollArea
+from ui.services.settings_service import SettingsService
+from ui.widgets.smooth_scroll import SmoothScrollArea
+from ui.widgets.page_layout import build_page_content, make_card
 
 
 class SettingsPage(QWidget):
     ffmpegPathRequested = pyqtSignal(str)
     backgroundChanged = pyqtSignal(str, int, int)
 
-    def __init__(self, settings: QSettings, parent=None):
+    def __init__(self, settings: SettingsService, parent=None):
         super().__init__(parent)
         self.setObjectName("settingsPage")
         self._settings = settings
@@ -26,12 +28,7 @@ class SettingsPage(QWidget):
         self.scroll = SmoothScrollArea(self)
         self.scroll.setWidgetResizable(True)
         outer.addWidget(self.scroll)
-        content = QWidget(self.scroll)
-        self.scroll.setWidget(content)
-        self.content_layout = QVBoxLayout(content)
-        self.content_layout.setContentsMargins(30, 22, 30, 26)
-        self.content_layout.setSpacing(14)
-        self.content_layout.addWidget(TitleLabel("设置", content))
+        _content, self.content_layout = build_page_content(self.scroll, "设置", "", object_name="settingsContent")
         self._BuildFfmpegCard()
         self._BuildBackgroundCard()
         card, layout = self._MakeCard("滚动")
@@ -39,13 +36,7 @@ class SettingsPage(QWidget):
         self.content_layout.addStretch(1)
 
     def _MakeCard(self, title):
-        card = HeaderCardWidget(self.scroll)
-        card.setTitle(title)
-        body = QWidget(card)
-        layout = QVBoxLayout(body)
-        layout.setSpacing(10)
-        layout.setContentsMargins(0, 0, 0, 0)
-        card.viewLayout.addWidget(body)
+        card, layout = make_card(self.scroll, title)
         self.content_layout.addWidget(card)
         return card, layout
 
@@ -125,6 +116,12 @@ class SettingsPage(QWidget):
 
     def SetFfmpegStatus(self, message: str) -> None:
         self.ffmpeg_status.setText(message)
+
+    def SetEnvironment(self, snapshot) -> None:
+        self.SetFfmpegStatus(snapshot.message)
+
+    def SetBackgroundStatus(self, message: str) -> None:
+        self.background_status.setText(message)
 
     def _BrowseBackground(self) -> None:
         path, _ = QFileDialog.getOpenFileName(self, "选择背景图片", self.background_line.text(), "图片 (*.jpg *.jpeg *.png *.webp *.bmp);;所有文件 (*)")

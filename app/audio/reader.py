@@ -12,6 +12,7 @@ from .models import AudioInfo, TrackEdit
 from app import converter
 from app.errors import FfmpegError
 from app.ffmpeg_environment import locate_ffprobe
+from app.input_paths import walk_files, unique_input_paths, check_scan_cancelled
 from app.task_models import LogEvent, LogLevel, TaskProgress, TaskResult
 
 
@@ -22,14 +23,29 @@ def is_audio_file(path: Path) -> bool:
             and not path.name.lower().endswith(".part"))
 
 
-def collect_audio_files(folder: str | Path) -> list[Path]:
+def collect_audio_files(folder: str | Path, *, cancel_check=None) -> list[Path]:
+    check_scan_cancelled(cancel_check)
     root = Path(folder)
     if not root.exists():
         raise MetadataError(f"路径不存在：{root}")
     if not root.is_dir():
         raise MetadataError(f"不是文件夹：{root}")
-    return sorted((path for path in root.rglob("*") if is_audio_file(path)),
+    return sorted((path for path in walk_files(root, cancel_check=cancel_check) if is_audio_file(path)),
                   key=lambda path: str(path).lower())
+
+
+def collect_audio_inputs(paths, *, cancel_check=None) -> list[Path]:
+    """元数据允许混选文件和目录；收集、过滤与去重都在后台调用。"""
+    collected = []
+    for path in unique_input_paths(paths, cancel_check=cancel_check):
+        check_scan_cancelled(cancel_check)
+        if path.is_dir():
+            collected.extend(collect_audio_files(path, cancel_check=cancel_check))
+        elif is_audio_file(path):
+            collected.append(path)
+        elif not path.exists():
+            raise MetadataError(f"路径不存在：{path}")
+    return unique_input_paths(collected, cancel_check=cancel_check)
 
 
 def locate_audio_ffprobe(ffmpeg_path: str | None = None) -> str:

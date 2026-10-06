@@ -12,16 +12,20 @@ from qfluentwidgets import (
     StrongBodyLabel,
 )
 
-from ui.AlbumPage import AlbumPage
-from ui.MetadataPage import MetadataPage
+from ui.audio.album_page import AlbumPage
+from ui.audio.metadata.page import MetadataPage
+from ui.services.settings_service import SettingsService
+from ui.services.desktop_actions import DesktopActions
 
 
 class AudioPage(QWidget):
     """音频处理模块主页：元数据编辑 + 专辑批处理入口。"""
 
-    def __init__(self, parent=None):
+    def __init__(self, parent=None, *, settings=None, desktop_actions=None):
         super().__init__(parent)
         self.setObjectName("audioPage")
+        self._settings = settings if settings is not None else SettingsService()
+        self._desktop_actions = desktop_actions if desktop_actions is not None else DesktopActions()
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -31,7 +35,7 @@ class AudioPage(QWidget):
         layout.addWidget(self._stack)
 
         self._home_page = self._BuildHomePage()
-        self.album_page = AlbumPage(self)
+        self.album_page = AlbumPage(self, settings=self._settings, desktop_actions=self._desktop_actions)
         self._stack.addWidget(self._home_page)
         self._stack.addWidget(self.album_page)
 
@@ -49,7 +53,7 @@ class AudioPage(QWidget):
         layout.setSpacing(0)
 
         # 元数据页拥有整个滚动流；专辑批处理入口附在其最底部，随页面一起滚动。
-        self.metadata_page = MetadataPage(page)
+        self.metadata_page = MetadataPage(page, settings=self._settings, desktop_actions=self._desktop_actions)
         layout.addWidget(self.metadata_page, 1)
         self.metadata_page.AddBottomWidget(self._BuildAlbumEntryCard(self.metadata_page))
         return page
@@ -88,6 +92,10 @@ class AudioPage(QWidget):
     def SetFfmpegPath(self, path: str | None) -> None:
         self.album_page.SetFfmpegPath(path)
         self.metadata_page.SetFfmpegPath(path)
+
+    def SetEnvironment(self, snapshot) -> None:
+        self.album_page.SetEnvironment(snapshot)
+        self.metadata_page.SetEnvironment(snapshot)
 
     def Shutdown(self) -> None:
         self.album_page.Shutdown()

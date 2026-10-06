@@ -7,15 +7,18 @@ from PyQt6.QtWidgets import QAbstractScrollArea
 from qfluentwidgets import FluentIcon, FluentWindow, MSFluentWindow, NavigationItemPosition
 from qfluentwidgets.common.icon import toQIcon
 
-from ui.AudioPage import AudioPage
-from ui.Background import BackgroundLayer
-from ui.Controls import CachedIcon
-from ui.FfmpegService import FfmpegService
-from ui.ImagePage import ImagePage
-from ui.SettingsPage import SettingsPage
-from ui.SmoothScroll import EnableSmoothScrolling
-from ui.VideoPage import VideoPage
+from ui.audio.page import AudioPage
+from ui.widgets.background import BackgroundLayer
+from ui.widgets.cached_icon import CachedIcon
+from ui.services.ffmpeg_service import FfmpegService
+from ui.services.settings_service import SettingsService
+from ui.services.desktop_actions import DesktopActions
+from ui.image.page import ImagePage
+from ui.settings.page import SettingsPage
+from ui.widgets.smooth_scroll import EnableSmoothScrolling
+from ui.video.page import VideoPage
 from ui.tasks.controller import TaskController
+from ui.tasks.preview import PreviewController
 
 
 class _MainWindowMixin:
@@ -31,7 +34,8 @@ class _MainWindowMixin:
         self.setMinimumSize(900, 650)
         self.setWindowIcon(toQIcon(FluentIcon.PHOTO))
 
-        self._settings = QSettings("CompressImages", "ImageConverter")
+        self._settings = SettingsService(QSettings("CompressImages", "ImageConverter"))
+        self._desktop_actions = DesktopActions()
         geometry = self._settings.value("window/geometry")
         if geometry:
             self.restoreGeometry(geometry)
@@ -39,15 +43,15 @@ class _MainWindowMixin:
         self._background_layer = BackgroundLayer(self)
         self._background_layer.setGeometry(self.rect())
         self._ffmpeg_service = FfmpegService(self._settings, self)
-        self.image_page = ImagePage(self)
-        self.audio_page = AudioPage(self)
-        self.video_page = VideoPage(self)
+        self.image_page = ImagePage(self, settings=self._settings, desktop_actions=self._desktop_actions)
+        self.audio_page = AudioPage(self, settings=self._settings, desktop_actions=self._desktop_actions)
+        self.video_page = VideoPage(self, settings=self._settings, desktop_actions=self._desktop_actions)
         self.settings_page = SettingsPage(self._settings, self)
         for area in self.findChildren(QAbstractScrollArea):
             EnableSmoothScrolling(area)
         self.settings_page.ffmpegPathRequested.connect(self._ffmpeg_service.SetPath)
         self.settings_page.backgroundChanged.connect(self._ConfigureBackground)
-        self._ffmpeg_service.stateChanged.connect(self._SyncFfmpegState)
+        self._ffmpeg_service.environmentChanged.connect(self._SyncEnvironment)
 
         self.addSubInterface(self.image_page, CachedIcon(FluentIcon.PHOTO), "图片处理", isTransparent=True)
         self.addSubInterface(self.audio_page, CachedIcon(FluentIcon.MUSIC), "音频处理", isTransparent=True)
@@ -57,15 +61,15 @@ class _MainWindowMixin:
         self.settings_page.RestoreBackground()
         QTimer.singleShot(0, self._ffmpeg_service.Start)
 
-    def _SyncFfmpegState(self, path, capabilities, message: str) -> None:
-        self.image_page.SetFfmpegPath(path, capabilities, message)
-        self.audio_page.SetFfmpegPath(path)
-        self.video_page.SetFfmpegPath(path, capabilities)
-        self.settings_page.SetFfmpegStatus(message)
+    def _SyncEnvironment(self, snapshot) -> None:
+        self.image_page.SetEnvironment(snapshot)
+        self.audio_page.SetEnvironment(snapshot)
+        self.video_page.SetEnvironment(snapshot)
+        self.settings_page.SetEnvironment(snapshot)
 
     def _ConfigureBackground(self, path: str, transparency: int, blur: int) -> None:
         error = self._background_layer.Configure(path, transparency, blur)
-        self.settings_page.background_status.setText(f"✗ {error}" if error else "")
+        self.settings_page.SetBackgroundStatus(f"✗ {error}" if error else "")
 
     def resizeEvent(self, event) -> None:  # noqa: N802
         super().resizeEvent(event)
@@ -76,7 +80,8 @@ class _MainWindowMixin:
         if not self._closing:
             self._closing = True
             # 弹窗中的导出任务也属于窗口资源；先登记，再同时请求停止。
-            self._shutdown_sources = [*self.findChildren(TaskController), self._ffmpeg_service]
+            self._shutdown_sources = [*self.findChildren(TaskController),
+                                      *self.findChildren(PreviewController), self._ffmpeg_service]
             for source in self._shutdown_sources:
                 source.idle.connect(self._TryCompleteClose)
             self._settings.setValue("window/geometry", self.saveGeometry())

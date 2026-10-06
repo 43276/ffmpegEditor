@@ -19,10 +19,11 @@ from PyQt6.QtWidgets import QApplication, QDialog
 from app.audio.models import AudioInfo, TrackEdit
 from app.ffmpeg_environment import FfmpegCapabilities, probe_ffmpeg
 from app.task_models import LogEvent, LogLevel, ProcessResult, TaskProgress, TaskResult, TaskStatistics
-from ui.AlbumPage import AlbumPage
-from ui.ImagePage import ImagePage
-from ui.MainWindow import FallbackMainWindow, MainWindow
-from ui.MetadataPage import MetadataPage, _CoverDialog
+from ui.audio.album_page import AlbumPage
+from ui.image.page import ImagePage
+from ui.main_window import FallbackMainWindow, MainWindow
+from ui.audio.metadata.page import MetadataPage
+from ui.audio.metadata.dialogs import CoverDialog as _CoverDialog
 from ui.tasks.controller import TaskController, TaskState
 from ui.tasks.jobs import cover_export_job
 from ui.tasks.worker import TaskWorker
@@ -227,8 +228,7 @@ class TaskLifecycleTests(unittest.TestCase):
         for page_type in (ImagePage, AlbumPage):
             with self.subTest(page=page_type.__name__):
                 release = threading.Event()
-                with patch("ui.ImagePage.QSettings", return_value=self.settings):
-                    page = page_type()
+                page = page_type(settings=self.settings)
                 if page_type is ImagePage:
                     page.SetFfmpegPath("ffmpeg", CAPS, "test")
                     page._SetInputPaths([self.sample("image.png")])
@@ -240,6 +240,7 @@ class TaskLifecycleTests(unittest.TestCase):
                     self.sample("albums/Album/track.mp3")
                     page.SetFfmpegPath("ffmpeg")
                     page._SetRootPath(self.root / "albums")
+                wait_until(lambda: not page._preview_controller.active)
                 try:
                     def process(command, **kwargs):
                         Path(command[-1]).write_bytes(b"converted")
@@ -341,7 +342,7 @@ class TaskLifecycleTests(unittest.TestCase):
                 dialog.finished.connect(finished.append)
                 dialog.show()
                 try:
-                    with patch("ui.MetadataPage.QFileDialog.getExistingDirectory", return_value=str(self.root / action)), \
+                    with patch("ui.audio.metadata.dialogs.QFileDialog.getExistingDirectory", return_value=str(self.root / action)), \
                             patch("app.converter.execute", side_effect=process):
                         dialog._OnExportAll()
                         wait_until(process.entered.is_set)
@@ -377,7 +378,7 @@ class TaskLifecycleTests(unittest.TestCase):
                 Path(command[-1]).write_bytes(b"cover")
                 return ProcessResult(0)
 
-            with patch("ui.MetadataPage.QFileDialog.getExistingDirectory", return_value=str(destination)), \
+            with patch("ui.audio.metadata.dialogs.QFileDialog.getExistingDirectory", return_value=str(destination)), \
                     patch("ui.tasks.controller.TaskWorker", delayed_worker(release)), \
                     patch("app.converter.execute", side_effect=process):
                 dialog._OnExportAll()
@@ -428,7 +429,7 @@ class TaskLifecycleTests(unittest.TestCase):
     def test_modal_cover_dialog_defers_deletion_after_result_until_thread_exit(self):
         source = self.sample("track.mp3")
         page = MetadataPage()
-        dialog = _CoverDialog(page, "all", "ffmpeg", [(source, "mjpeg")], page._cover_temp_path)
+        dialog = _CoverDialog(page, "all", "ffmpeg", [(source, "mjpeg")], page._controller.resources)
         dialog.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
         controller = dialog._export_controller
         release = threading.Event()
@@ -447,7 +448,7 @@ class TaskLifecycleTests(unittest.TestCase):
             QTimer.singleShot(20, release.set)
 
         try:
-            with patch("ui.MetadataPage.QFileDialog.getExistingDirectory", return_value=str(self.root / "covers")), \
+            with patch("ui.audio.metadata.dialogs.QFileDialog.getExistingDirectory", return_value=str(self.root / "covers")), \
                     patch("ui.tasks.controller.TaskWorker", delayed_worker(release)), \
                     patch("app.converter.execute", side_effect=process):
                 QTimer.singleShot(0, dialog._OnExportAll)
@@ -467,11 +468,11 @@ class TaskLifecycleTests(unittest.TestCase):
         source = self.sample("track.mp3")
         cover = page._cover_temp_path / "pasted.png"
         cover.write_bytes(b"cover")
-        dialog = _CoverDialog(page, "all", "ffmpeg", [(source, "mjpeg")], page._cover_temp_path)
+        dialog = _CoverDialog(page, "all", "ffmpeg", [(source, "mjpeg")], page._controller.resources)
         dialog.show()
         process = HeldProcess()
         try:
-            with patch("ui.MetadataPage.QFileDialog.getExistingDirectory", return_value=str(self.root / "covers")), \
+            with patch("ui.audio.metadata.dialogs.QFileDialog.getExistingDirectory", return_value=str(self.root / "covers")), \
                     patch("app.converter.execute", side_effect=process):
                 dialog._OnExportAll()
                 wait_until(process.entered.is_set)
@@ -509,15 +510,13 @@ class TaskLifecycleTests(unittest.TestCase):
                         return TaskResult(cancelled=context.cancel_check())
                     return run
 
-                with patch("ui.MainWindow.QSettings", return_value=self.settings), \
-                        patch("ui.ImagePage.QSettings", return_value=self.settings), \
-                        patch("ui.VideoPage.QSettings", return_value=self.settings), \
-                        patch("ui.FfmpegService.FfmpegService.Start"):
+                with patch("ui.main_window.QSettings", return_value=self.settings), \
+                        patch("ui.services.ffmpeg_service.FfmpegService.Start"):
                     window = window_type()
                     window.show()
                     APP.processEvents()
                     page = window.audio_page.metadata_page
-                    dialog = _CoverDialog(page, "all", "ffmpeg", [], page._cover_temp_path)
+                    dialog = _CoverDialog(page, "all", "ffmpeg", [], page._controller.resources)
                     dialog.show()
                     controllers = window.findChildren(TaskController)
                     for controller in controllers:
@@ -533,8 +532,8 @@ class TaskLifecycleTests(unittest.TestCase):
                         return CAPS
 
                     try:
-                        with patch("ui.FfmpegService.locate_ffmpeg", return_value="ffmpeg"), \
-                                patch("ui.FfmpegService.probe_ffmpeg", side_effect=probe):
+                        with patch("ui.services.ffmpeg_service.locate_ffmpeg", return_value="ffmpeg"), \
+                                patch("ui.services.ffmpeg_service.probe_ffmpeg", side_effect=probe):
                             window._ffmpeg_service.SetPath("ffmpeg")
                             wait_until(lambda: all(event.is_set() for event in entered))
                             tick = []

@@ -8,6 +8,7 @@ from typing import Callable
 from PyQt6.QtCore import QThread, pyqtSignal
 
 from app.task_models import LogEvent, LogLevel, TaskProgress, TaskResult, TaskStatistics
+from app.input_paths import ScanCancelled
 
 
 @dataclass(frozen=True)
@@ -58,6 +59,8 @@ class TaskWorker(QThread):
                 self.result = TaskResult(total=self._total, cancelled=True)
             else:
                 self.result = self._operation(context)
+        except ScanCancelled:
+            self.result = TaskResult(total=self._total, cancelled=True)
         except Exception as exc:
             message = f"任务异常：{exc}"
             context.on_log(LogEvent(LogLevel.ERROR, message))

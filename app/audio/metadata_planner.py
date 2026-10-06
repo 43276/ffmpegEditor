@@ -10,6 +10,7 @@ from .formats import (
 )
 from .metadata_commands import build_metadata_command
 from .models import TrackEdit
+from app.input_paths import check_scan_cancelled
 from app.output_files import path_key, temporary_path_for, unique_path_for
 from app.task_models import BatchPlan, FilePlan, ProcessStep, TaskPlan
 
@@ -130,10 +131,12 @@ def build_output_plan(
 def build_metadata_task(
     ffmpeg_path: str, edits: list[TrackEdit], overwrite: bool, in_place: bool,
     output_root: str | Path | None,
+    *, cancel_check=None,
 ) -> TaskPlan:
     taken = {path_key(edit.path) for edit in edits}
     files: list[FilePlan] = []
     for edit in edits:
+        check_scan_cancelled(cancel_check)
         try:
             files.append(build_output_plan(ffmpeg_path, edit, overwrite, in_place, output_root, taken))
         except (MetadataError, OSError, ValueError) as exc:
