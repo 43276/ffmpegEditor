@@ -2,6 +2,7 @@ __pycache__/
 .reasonix/
 build/
 dist/
+tests/
 
 *.spec
 requirements.txt
