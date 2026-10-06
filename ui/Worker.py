@@ -2,17 +2,19 @@
 """
 from __future__ import annotations
 
-from pathlib import Path
-
 from PyQt6.QtCore import QThread, pyqtSignal
 
 from app.Converter import BuildCommand, ConverterError, OutputNameFor, RunFileProcess
-from app.Core import Batch, ConvertOptions
+from app.image.models import Batch, ConvertOptions
+from app.ffmpeg_environment import FfmpegCapabilities
 
-LOG_INFO = 0
-LOG_OK = 1
-LOG_WARN = 2
-LOG_ERROR = 3
+from app.output_files import (
+    commit_output, ensure_output_directory, output_transaction,
+    path_key, reserve_output_path, temporary_path_for,
+)
+from app.task_models import (
+    LOG_ERROR, LOG_INFO, LOG_OK, LOG_WARN, FilePlan, TaskProgress, TaskResult,
+)
 
 
 class ConvertWorker(QThread):
@@ -21,21 +23,21 @@ class ConvertWorker(QThread):
     信号：
     - logMessage(int 线程号, int 级别, str 文本)：追加一条日志；
     - progressChanged(int 线程号, int 已完成, int 总数, str 当前文件)：进度变化；
-    - taskFinished(int 线程号, dict)：线程结束汇总
-      {total, ok, failed, skipped, cancelled, output_dirs}。
+    - taskFinished(int 线程号, TaskResult)：线程结束汇总
+      包含计数、停止状态、输出目录与日志。
     """
 
     logMessage = pyqtSignal(int, int, str)
     progressChanged = pyqtSignal(int, int, int, str)
     statisticsChanged = pyqtSignal(int, int, int, int, int, int)
-    taskFinished = pyqtSignal(int, dict)
+    taskFinished = pyqtSignal(int, object)
 
     def __init__(
         self,
         thread_id: int,
         batches: list[Batch],
         options: ConvertOptions,
-        capabilities,
+        capabilities: FfmpegCapabilities,
         parent=None,
     ):
         super().__init__(parent)
@@ -61,6 +63,10 @@ class ConvertWorker(QThread):
     def _Log(self, level: int, text: str) -> None:
         self.logMessage.emit(self._thread_id, level, text)
 
+    def _Progress(self, done: int, total: int, current_file: str) -> None:
+        progress = TaskProgress(done, total, current_file)
+        self.progressChanged.emit(self._thread_id, progress.done, progress.total, progress.current_file)
+
     def run(self) -> None:
         options = self._options
         total_files = sum(len(batch.files) for batch in self._batches)
@@ -70,6 +76,7 @@ class ConvertWorker(QThread):
         skipped_count = 0
         cancelled = False
         early_stopped = False
+        used_outputs = {path_key(source) for batch in self._batches for source in batch.files}
         output_dirs: list[str] = []
         error_logs: list[str] = []
         skipped_logs: list[str] = []
@@ -98,7 +105,7 @@ class ConvertWorker(QThread):
                 if self._finish_requested:
                     early_stopped = True
                     break
-                batch.output_dir.mkdir(parents=True, exist_ok=True)
+                ensure_output_directory(batch.output_dir)
                 if str(batch.output_dir) not in output_dirs:
                     output_dirs.append(str(batch.output_dir))
                 self._Log(
@@ -113,7 +120,8 @@ class ConvertWorker(QThread):
                         break
 
                     dst_name = OutputNameFor(src_file, options.target_extension)
-                    dst_path = batch.output_dir / dst_name
+                    dst_path = reserve_output_path(batch.output_dir / dst_name, used_outputs)
+                    dst_name = dst_path.name
                     done += 1
 
                     if dst_path.exists() and not options.overwrite:
@@ -121,70 +129,44 @@ class ConvertWorker(QThread):
                         message = f"已跳过（输出文件已存在）：{dst_name}"
                         skipped_logs.append(message)
                         self._Log(LOG_WARN, message)
-                        self.progressChanged.emit(self._thread_id, done, total_files, dst_name)
+                        self._Progress(done, total_files, dst_name)
                         emit_statistics()
                         continue
 
-                    temp_path = dst_path.with_name(f".{dst_path.name}.part{dst_path.suffix}")
-                    try:
-                        temp_path.unlink(missing_ok=True)
-                    except OSError as exc:
-                        failed_count += 1
-                        message = f"{src_file.name}：无法清理临时文件：{exc}"
-                        error_logs.append(message)
-                        self._Log(LOG_ERROR, message)
-                        self.progressChanged.emit(self._thread_id, done, total_files, src_file.name)
-                        emit_statistics()
-                        continue
-
+                    temp_path = temporary_path_for(dst_path)
                     try:
                         cmd = BuildCommand(options, self._capabilities, src_file)
-                        cmd.append(str(temp_path))  # 先写临时文件，成功后再替换正式文件
-                    except ConverterError as exc:
-                        failed_count += 1
-                        message = f"{src_file.name}：{exc}"
-                        error_logs.append(message)
-                        self._Log(LOG_ERROR, message)
-                        self.progressChanged.emit(self._thread_id, done, total_files, src_file.name)
-                        emit_statistics()
-                        continue
-
-                    return_code, error_tail, was_cancelled = RunFileProcess(
-                        cmd, cancel_check=self._CancelCheck
-                    )
-                    if was_cancelled:
-                        temp_path.unlink(missing_ok=True)
-                        cancelled = True
-                        done -= 1
-                        break
-                    if return_code == 0:
-                        try:
-                            if not options.overwrite and dst_path.exists():
-                                temp_path.unlink(missing_ok=True)
+                        cmd.append(str(temp_path))
+                        file_plan = FilePlan(src_file, dst_path, temp_path, tuple(cmd),
+                                             overwrite=options.overwrite)
+                        with output_transaction(file_plan):
+                            result = RunFileProcess(file_plan.command, cancel_check=self._CancelCheck)
+                            if result.cancelled or self._cancel_requested:
+                                cancelled = True
+                                done -= 1
+                                break
+                            if not result.succeeded:
+                                failed_count += 1
+                                message = f"{src_file.name} 转换失败：{result.stderr or 'ffmpeg 返回未知错误'}"
+                                error_logs.append(message)
+                                self._Log(LOG_ERROR, message)
+                            elif commit_output(file_plan):
+                                ok_count += 1
+                                self._Log(LOG_OK, f"{src_file.name} → {dst_name} 完成")
+                            else:
                                 skipped_count += 1
                                 message = f"已跳过（输出文件已存在）：{dst_name}"
                                 skipped_logs.append(message)
                                 self._Log(LOG_WARN, message)
-                            else:
-                                temp_path.replace(dst_path)
-                                ok_count += 1
-                                self._Log(LOG_OK, f"{src_file.name} → {dst_name} 完成")
-                        except OSError as exc:
-                            temp_path.unlink(missing_ok=True)
-                            failed_count += 1
-                            message = f"{src_file.name}：无法保存输出文件：{exc}"
-                            error_logs.append(message)
-                            self._Log(LOG_ERROR, message)
-                    else:
-                        temp_path.unlink(missing_ok=True)
+                    except (OSError, ConverterError, ValueError) as exc:
                         failed_count += 1
-                        detail = error_tail or "ffmpeg 返回未知错误"
-                        message = f"{src_file.name} 转换失败：{detail}"
+                        message = f"{src_file.name}：{exc}"
                         error_logs.append(message)
                         self._Log(LOG_ERROR, message)
-                    self.progressChanged.emit(self._thread_id, done, total_files, src_file.name)
+                    self._Progress(done, total_files, src_file.name)
                     emit_statistics()
         except Exception as exc:  # noqa: BLE001 —— 保证线程异常时也能汇报并结束
+            failed_count += 1
             message = f"线程内部异常：{exc}"
             error_logs.append(message)
             self._Log(LOG_ERROR, message)
@@ -205,14 +187,14 @@ class ConvertWorker(QThread):
 
         emit_statistics()
 
-        self.taskFinished.emit(self._thread_id, {
-            "total": total_files,
-            "ok": ok_count,
-            "failed": failed_count,
-            "skipped": skipped_count,
-            "cancelled": cancelled,
-            "early_stopped": early_stopped,
-            "output_dirs": output_dirs,
-            "error_logs": error_logs,
-            "skipped_logs": skipped_logs,
-        })
+        self.taskFinished.emit(self._thread_id, TaskResult(
+            total=total_files,
+            ok=ok_count,
+            failed=failed_count,
+            skipped=skipped_count,
+            cancelled=cancelled,
+            early_stopped=early_stopped,
+            output_dirs=output_dirs,
+            error_logs=error_logs,
+            skipped_logs=skipped_logs,
+        ))

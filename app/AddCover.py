@@ -1,81 +1,11 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from .audio.formats import AUDIO_EXTENSIONS, IMAGE_EXTENSIONS
+from .audio.models import AlbumAudioGroup, AlbumPlan, AlbumSkippedDir, AlbumTask, TrackMetadata
 from pathlib import Path
-
-AUDIO_EXTENSIONS = {
-    ".mp3",
-    ".m4a",
-    ".mp4",
-    ".aac",
-    ".flac",
-    ".ogg",
-    ".opus",
-    ".wav",
-    ".wma",
-    ".alac",
-}
-
-IMAGE_EXTENSIONS = {
-    ".jpg",
-    ".jpeg",
-    ".png",
-    ".webp",
-    ".bmp",
-}
-
 
 class AlbumCoverError(Exception):
     """专辑封面处理相关的可预期错误，消息可直接展示给用户。"""
-
-
-@dataclass(frozen=True)
-class TrackMetadata:
-    album: str
-    artist: str
-
-
-@dataclass
-class AlbumAudioGroup:
-    """同一音频目录下的一批音频，统一输出到 output_dir。"""
-
-    audio_dir: Path
-    output_dir: Path
-    files: list[Path]
-
-
-@dataclass
-class AlbumTask:
-    """一张专辑的处理任务：一张封面 + 元数据 + 若干音频分组。"""
-
-    processing_dir: Path
-    image_path: Path
-    metadata: TrackMetadata
-    groups: list[AlbumAudioGroup]
-
-    @property
-    def file_count(self) -> int:
-        return sum(len(group.files) for group in self.groups)
-
-
-@dataclass
-class AlbumSkippedDir:
-    """被跳过的专辑文件夹及原因。"""
-
-    processing_dir: Path
-    reason: str
-
-
-@dataclass
-class AlbumPlan:
-    """专辑批处理计划：可处理任务 + 被跳过的文件夹。"""
-
-    tasks: list[AlbumTask]
-    skipped_dirs: list[AlbumSkippedDir]
-
-    @property
-    def file_count(self) -> int:
-        return sum(task.file_count for task in self.tasks)
 
 
 def ReadTextValue(path: Path) -> str:

@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from PyQt6.QtCore import QObject, QSettings, QThread, pyqtSignal
 
-from app.Converter import LocateFfmpeg, ProbeFfmpeg
+from app.ffmpeg_environment import locate_ffmpeg, probe_ffmpeg
 
 
 class _ProbeThread(QThread):
@@ -16,8 +16,8 @@ class _ProbeThread(QThread):
 
     def run(self) -> None:
         try:
-            self.path = LocateFfmpeg(self.explicit or None)
-            self.capabilities = ProbeFfmpeg(self.path)
+            self.path = locate_ffmpeg(self.explicit or None)
+            self.capabilities = probe_ffmpeg(self.path)
         except Exception as exc:  # noqa: BLE001 -- 在线程结束后统一报告
             self.error = str(exc)
 

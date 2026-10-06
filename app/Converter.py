@@ -1,22 +1,20 @@
-"""ffmpeg 封装：探测能力、按参数构建命令行、执行单文件转换。"""
+"""转换执行与尚待第二阶段迁移的图片命令入口。"""
 from __future__ import annotations
 
 import os
-import shutil
 import subprocess
 import tempfile
 import time
-from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable
+from contextlib import ExitStack
+from typing import Callable, Sequence
 
-from .Core import ANIMATED_EXTENSIONS, ConvertOptions
-
-# AV1 编码器优先级：libsvtavif 快，libaom-av1 是兜底
-_AV1_ENCODERS: tuple[str, ...] = ("libsvtavif", "libaom-av1")
-
-# 动画 WebP 编码器：libwebp_anim 才能保留多帧，缺失时退回单帧的 libwebp
-_WEBP_ANIM_ENCODER = "libwebp_anim"
+from .Core import ANIMATED_EXTENSIONS
+from .image.models import ConvertOptions
+from .image.commands import select_image_encoder
+from .errors import FfmpegError as ConverterError
+from .ffmpeg_environment import FfmpegCapabilities
+from .task_models import ProcessResult
 
 # 目标 WebP 编码器单边像素上限，超出会直接报错
 _WEBP_MAX_DIMENSION = 16383
@@ -26,117 +24,6 @@ _GIF_MIN_COLORS = 32
 _GIF_MAX_COLORS = 256
 
 
-class ConverterError(Exception):
-    """ffmpeg 相关的可预期错误，消息可直接展示给用户。"""
-
-
-def LocateFfmpeg(explicit: str | None = None) -> str:
-    """返回 ffmpeg 可执行文件路径；找不到时抛 ConverterError。"""
-    if explicit:
-        candidate = Path(explicit)
-        if candidate.is_file():
-            return str(candidate.resolve())
-        raise ConverterError(f"ffmpeg 路径不存在：{explicit}")
-    found = shutil.which("ffmpeg")
-    if found:
-        return found
-    raise ConverterError("未在 PATH 中找到 ffmpeg，请在界面中手动指定 ffmpeg.exe 位置")
-
-
-@dataclass
-class FfmpegCapabilities:
-    version: str
-    encoders: set[str]
-    av1_encoder: str | None          # libsvtavif / libaom-av1，都不支持则为 None
-    avif_ok: bool                    # 能否输出 AVIF
-    gif_ok: bool                     # 能否输出 GIF
-
-    def VideoEncoderName(
-        self, target_extension: str, source_extension: str | None = None
-    ) -> str:
-        """根据目标扩展名返回 ffmpeg 视频编码器名，不支持时抛 ConverterError。
-
-        source_extension 用于判断源是否可能为多帧动画（GIF / WebP）：这类源
-        转 WebP 时优先使用 libwebp_anim，否则动画会被丢成单帧。
-        """
-        ext = target_extension.lower()
-        if ext in (".jpg", ".jpeg"):
-            return "mjpeg"
-        if ext == ".png":
-            return "png"
-        if ext == ".webp":
-            source_ext = (source_extension or "").lower()
-            if source_ext in ANIMATED_EXTENSIONS and _WEBP_ANIM_ENCODER in self.encoders:
-                return _WEBP_ANIM_ENCODER
-            if "libwebp" not in self.encoders:
-                raise ConverterError("当前 ffmpeg 缺少 libwebp 编码器，无法输出 WebP")
-            return "libwebp"
-        if ext == ".gif":
-            if not self.gif_ok:
-                raise ConverterError("当前 ffmpeg 缺少 gif 编码器，无法输出 GIF")
-            return "gif"
-        if ext == ".avif":
-            if not self.avif_ok:
-                raise ConverterError("当前 ffmpeg 不支持 AVIF 编码（缺少 AV1 编码器或 avif 封装器）")
-            return self.av1_encoder or "libaom-av1"
-        if ext == ".bmp":
-            return "bmp"
-        if ext == ".tiff":
-            return "tiff"
-        raise ConverterError(f"不支持的目标格式：{ext}")
-
-
-def ProbeFfmpeg(ffmpeg_path: str) -> FfmpegCapabilities:
-    """运行 ffmpeg -version / -encoders / -muxers，探测可用编码能力。"""
-    try:
-        run_options = {
-            "capture_output": True,
-            "text": True,
-            "encoding": "utf-8",
-            "errors": "replace",
-            "timeout": 30,
-            # --windowed 只控制主程序，Windows 子进程需单独禁止创建控制台。
-            "creationflags": subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
-        }
-        version_result = subprocess.run([ffmpeg_path, "-version"], **run_options)
-        encoders_result = subprocess.run([ffmpeg_path, "-encoders"], **run_options)
-        muxers_result = subprocess.run([ffmpeg_path, "-muxers"], **run_options)
-    except OSError as exc:
-        raise ConverterError(f"无法运行 ffmpeg：{exc}") from exc
-
-    if version_result.returncode != 0:
-        detail = version_result.stderr.strip() or "未知错误"
-        raise ConverterError(f"ffmpeg 无法启动：{detail}")
-
-    first_line = version_result.stdout.splitlines()[0].strip() if version_result.stdout else ffmpeg_path
-    encoders = _ParseNameTokens(encoders_result.stdout)
-    muxers = _ParseNameTokens(muxers_result.stdout)
-    av1_encoder = next((name for name in _AV1_ENCODERS if name in encoders), None)
-    return FfmpegCapabilities(
-        version=first_line,
-        encoders=encoders,
-        av1_encoder=av1_encoder,
-        avif_ok=bool(av1_encoder) and "avif" in muxers,
-        gif_ok="gif" in encoders and "gif" in muxers,
-    )
-
-
-def _ParseNameTokens(text: str) -> set[str]:
-    """解析 `ffmpeg -encoders / -muxers` 输出中的名称列。"""
-    names: set[str] = set()
-    for raw_line in text.splitlines():
-        parts = raw_line.strip().split()
-        if len(parts) < 2:
-            continue
-        flag, name = parts[0], parts[1]
-        if ":" in flag or "=" in flag or name.startswith("="):
-            continue
-        if name.startswith(("-", "_")):
-            continue
-        names.add(name)
-    return names
-
-
 def OutputNameFor(src: Path, target_extension: str | None) -> str:
     """输出文件名：原文件名 + 目标后缀；保持原格式时沿用源扩展名。"""
     extension = target_extension.lower() if target_extension else src.suffix
@@ -144,7 +31,7 @@ def OutputNameFor(src: Path, target_extension: str | None) -> str:
 
 
 def BuildCommand(opts: ConvertOptions, capabilities: FfmpegCapabilities, src: Path) -> list[str]:
-    """为单个文件构建完整 ffmpeg 命令行。"""
+    """构建图片编码参数；实际写入路径由现有 Worker 追加。"""
     extension = (opts.target_extension or src.suffix).lower()
     cmd = [opts.ffmpeg_path, "-hide_banner", "-loglevel", "error"]
     cmd.append("-y" if opts.overwrite else "-n")
@@ -167,7 +54,7 @@ def BuildCommand(opts: ConvertOptions, capabilities: FfmpegCapabilities, src: Pa
             "force_original_aspect_ratio=decrease"
         )
 
-    encoder = capabilities.VideoEncoderName(extension, src.suffix)
+    encoder = select_image_encoder(capabilities, extension, src.suffix)
     cmd += ["-c:v", encoder]
 
     # GIF 只有 256 色调色板：先用 palettegen 生成调色板再 paletteuse 量化，
@@ -241,53 +128,54 @@ def QualityToFfmpegArgs(extension: str, quality: int | None) -> list[str]:
 
 
 def RunFileProcess(
-    cmd: list[str],
+    cmd: Sequence[str],
     cancel_check: Callable[[], bool] | None = None,
     timeout_seconds: float = 900.0,
-) -> tuple[int, str, bool]:
-    """执行单文件转换。
-
-    返回 (返回码, stderr 尾部文本, 是否被取消)。ffmpeg 的 stderr 会写到
-    临时文件，避免管道缓冲导致子进程阻塞，同时保证取消响应及时。
-    """
-    return_code = -1
+    *, capture_stdout: bool = False,
+) -> ProcessResult:
+    """执行命令并返回结构化结果；输出用临时文件收集，避免管道阻塞。"""
+    if cancel_check is not None and cancel_check():
+        return ProcessResult(-1, cancelled=True)
     cancelled = False
-    error_tail = ""
-
-    with tempfile.TemporaryFile(mode="w+t", encoding="utf-8", errors="replace") as error_file:
+    timed_out = False
+    with ExitStack() as stack:
+        error_file = stack.enter_context(tempfile.TemporaryFile())
+        output_file = stack.enter_context(tempfile.TemporaryFile()) if capture_stdout else None
         try:
             proc = subprocess.Popen(
                 cmd,
-                stdout=subprocess.DEVNULL,
+                stdout=output_file if output_file is not None else subprocess.DEVNULL,
                 stderr=error_file,
                 creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
             )
         except OSError as exc:
-            return -1, f"无法启动 ffmpeg：{exc}", False
-
-        started_at = time.time()
-        while proc.poll() is None:
-            if cancel_check is not None and cancel_check():
-                cancelled = True
+            return ProcessResult(-1, f"无法启动 ffmpeg：{exc}")
+        try:
+            started_at = time.monotonic()
+            while proc.poll() is None:
+                if cancel_check is not None and cancel_check():
+                    cancelled = True
+                    break
+                if time.monotonic() - started_at > timeout_seconds:
+                    timed_out = True
+                    break
+                time.sleep(0.05)
+        finally:
+            # 包括取消回调抛异常的情况，均不遗留正在写临时文件的子进程。
+            if proc.poll() is None:
                 proc.terminate()
                 try:
                     proc.wait(timeout=5)
                 except subprocess.TimeoutExpired:
                     proc.kill()
                     proc.wait(timeout=5)
-                break
-            if time.time() - started_at > timeout_seconds:
-                proc.kill()
-                proc.wait(timeout=5)
-                error_tail = "处理超时，已强制终止"
-                break
-            time.sleep(0.05)
-
-        return_code = proc.returncode if proc.returncode is not None else -1
-        if not error_tail:
-            error_file.seek(0)
-            text = error_file.read().strip()
-            if text:
-                error_tail = text[-1500:]
-
-    return return_code, error_tail, cancelled
+        error_file.seek(0, os.SEEK_END)
+        error_file.seek(max(0, error_file.tell() - 6000))
+        stderr = error_file.read().decode("utf-8", errors="replace").strip()[-1500:]
+        if timed_out:
+            stderr = "处理超时，已强制终止" + (f"\n{stderr}" if stderr else "")
+        stdout = b""
+        if output_file is not None:
+            output_file.seek(0)
+            stdout = output_file.read()
+        return ProcessResult(proc.returncode, stderr, cancelled, timed_out, stdout)

@@ -16,7 +16,8 @@ from PyQt6.QtGui import QWheelEvent
 from PyQt6.QtTest import QTest
 from PyQt6.QtWidgets import QApplication, QLabel, QVBoxLayout, QWidget
 
-from app.Converter import FfmpegCapabilities
+from app.ffmpeg_environment import FfmpegCapabilities
+from app.task_models import ProcessResult
 from app.VideoCore import VideoBatch, VideoCompressOptions
 from ui.FfmpegService import FfmpegService
 from ui.SmoothScroll import SmoothScrollArea
@@ -24,7 +25,7 @@ from ui.VideoPage import VideoPage
 from ui.VideoWorker import VideoCompressWorker
 
 
-CAPS = FfmpegCapabilities("test FFmpeg", {"libx264"}, None, False, True)
+CAPS = FfmpegCapabilities("test FFmpeg", {"libx264"}, {"mp4"})
 APP = QApplication.instance() or QApplication([])
 APP.setQuitOnLastWindowClosed(False)
 
@@ -56,12 +57,12 @@ class RegressionTests(unittest.TestCase):
             if path == "old.exe":
                 entered.set()
                 release.wait(2)
-            return FfmpegCapabilities(path, {"libx264"}, None, False, True)
+            return FfmpegCapabilities(path, {"libx264"}, {"mp4"})
 
         service = FfmpegService(self.settings)
         service.stateChanged.connect(lambda *state: states.append(state))
         try:
-            with patch("ui.FfmpegService.LocateFfmpeg", side_effect=lambda path: path), patch("ui.FfmpegService.ProbeFfmpeg", side_effect=probe):
+            with patch("ui.FfmpegService.locate_ffmpeg", side_effect=lambda path: path), patch("ui.FfmpegService.probe_ffmpeg", side_effect=probe):
                 service.SetPath("old.exe")
                 WaitUntil(entered.is_set)
                 service.SetPath("new.exe")
@@ -105,7 +106,7 @@ class RegressionTests(unittest.TestCase):
             deadline = time.monotonic() + 2
             while not cancel_check() and time.monotonic() < deadline:
                 time.sleep(0.005)
-            return -1, "", cancel_check()
+            return ProcessResult(-1, cancelled=cancel_check())
 
         try:
             with patch("ui.VideoWorker.RunFileProcess", side_effect=process), patch.object(page, "_ShowInfo"):
@@ -116,13 +117,13 @@ class RegressionTests(unittest.TestCase):
                 self.assertFalse(page.cancel_button.isEnabled())
                 WaitUntil(lambda: page._worker is None)
                 self.assertEqual(page.status.text(), "已取消")
-                self.assertTrue(summaries[-1]["cancelled"])
+                self.assertTrue(summaries[-1].cancelled)
                 self.assertFalse(list(self.root.rglob("*.part.mp4")))
                 self.assertEqual(source.read_bytes(), b"original video")
 
             def success(command, cancel_check):
                 Path(command[-1]).write_bytes(b"compressed video")
-                return 0, "", False
+                return ProcessResult(0)
 
             with patch("ui.VideoWorker.RunFileProcess", side_effect=success), patch.object(page, "_ShowInfo"):
                 page._Start()
@@ -152,7 +153,7 @@ class RegressionTests(unittest.TestCase):
             calls.append(command)
             Path(command[-1]).write_bytes(b"compressed")
             worker.RequestFinishAfterCurrentBatch()
-            return 0, "", False
+            return ProcessResult(0)
 
         try:
             with patch("ui.VideoWorker.RunFileProcess", side_effect=process):
@@ -160,8 +161,8 @@ class RegressionTests(unittest.TestCase):
                 WaitUntil(lambda: bool(summaries))
                 worker.wait()
             self.assertEqual(len(calls), 2)
-            self.assertTrue(summaries[-1]["early_stopped"])
-            self.assertEqual(summaries[-1]["ok"], 2)
+            self.assertTrue(summaries[-1].early_stopped)
+            self.assertEqual(summaries[-1].ok, 2)
             self.assertFalse((self.root / "later_output").exists())
             self.assertTrue(all(source.read_bytes() == b"original" for source in sources))
         finally:

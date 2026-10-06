@@ -30,11 +30,12 @@ from qfluentwidgets import (
 )
 from qfluentwidgets.common.style_sheet import isDarkTheme
 
-from app.AddCover import AlbumPlan, BuildAlbumPlan, SummarizeAlbumPlan
+from app.AddCover import BuildAlbumPlan, SummarizeAlbumPlan
+from app.audio.models import AlbumPlan
 from ui.AlbumWorker import AlbumWorker
 from ui.Controls import MakeSwitchButton
 from ui.SmoothScroll import SmoothScrollArea as ScrollArea
-from ui.Worker import LOG_ERROR, LOG_INFO, LOG_OK, LOG_WARN
+from app.task_models import LOG_ERROR, LOG_INFO, LOG_OK, LOG_WARN, TaskResult
 
 # 深浅主题下的日志颜色
 _LOG_COLORS = {
@@ -55,7 +56,7 @@ class AlbumPage(QWidget):
         self.setObjectName("albumPage")
 
         self._workers: list[AlbumWorker] = []
-        self._worker_summaries: dict[int, dict] = {}
+        self._worker_summaries: dict[int, TaskResult] = {}
         self._thread_progress: dict[int, tuple[int, int]] = {}
         self._planned_total = 0
         self._root_path: Path | None = None
@@ -393,72 +394,43 @@ class AlbumPage(QWidget):
     ) -> None:
         self._SetStatistics(total=total, ok=ok, failed=failed, skipped=skipped)
 
-    def _OnWorkerTaskFinished(self, thread_id: int, summary: dict) -> None:
+    def _OnWorkerTaskFinished(self, thread_id: int, summary: TaskResult) -> None:
         self._worker_summaries[thread_id] = summary
         if self._workers and len(self._worker_summaries) >= len(self._workers):
             self._OnAllWorkersFinished(self._MergeSummaries())
 
-    def _MergeSummaries(self) -> dict:
-        merged = {
-            "total": 0,
-            "ok": 0,
-            "failed": 0,
-            "skipped": 0,
-            "skipped_dirs": 0,
-            "cancelled": False,
-            "early_stopped": False,
-            "output_dirs": [],
-            "error_logs": [],
-            "skipped_logs": [],
-        }
-        seen_dirs: set[str] = set()
-        for summary in self._worker_summaries.values():
-            merged["total"] += summary["total"]
-            merged["ok"] += summary["ok"]
-            merged["failed"] += summary["failed"]
-            merged["skipped"] += summary["skipped"]
-            merged["skipped_dirs"] += summary.get("skipped_dirs", 0)
-            merged["cancelled"] = merged["cancelled"] or summary["cancelled"]
-            merged["early_stopped"] = (
-                merged["early_stopped"] or summary["early_stopped"]
-            )
-            merged["error_logs"].extend(summary.get("error_logs", []))
-            merged["skipped_logs"].extend(summary.get("skipped_logs", []))
-            for directory in summary["output_dirs"]:
-                if directory not in seen_dirs:
-                    seen_dirs.add(directory)
-                    merged["output_dirs"].append(directory)
-        return merged
+    def _MergeSummaries(self) -> TaskResult:
+        return TaskResult.merge(self._worker_summaries.values())
 
-    def _OnAllWorkersFinished(self, summary: dict) -> None:
-        if summary["cancelled"]:
+    def _OnAllWorkersFinished(self, summary: TaskResult) -> None:
+        if summary.cancelled:
             self._ShowInfoBar("任务已取消", "本次处理被手动中止", warning=True)
-        elif summary["early_stopped"]:
+        elif summary.early_stopped:
             self._ShowInfoBar(
                 "已按“结束”停止",
-                f"完成当前专辑后停止：成功 {summary['ok']}，失败 {summary['failed']}，"
-                f"跳过 {summary['skipped']}；剩余专辑未处理",
+                f"完成当前专辑后停止：成功 {summary.ok}，失败 {summary.failed}，"
+                f"跳过 {summary.skipped}；剩余专辑未处理",
                 warning=True,
             )
-        elif summary["failed"]:
+        elif summary.failed:
             self._ShowInfoBar(
                 "处理完成（有失败项）",
-                f"成功 {summary['ok']}，失败 {summary['failed']}，跳过 {summary['skipped']}",
+                f"成功 {summary.ok}，失败 {summary.failed}，跳过 {summary.skipped}",
                 warning=True,
             )
         else:
             self._ShowInfoBar(
                 "处理完成",
-                f"成功 {summary['ok']} 个音频，跳过 {summary['skipped']}",
+                f"成功 {summary.ok} 个音频，跳过 {summary.skipped}",
             )
-        self._last_output_dirs = summary["output_dirs"]
-        self._error_logs = summary.get("error_logs", [])
-        self._skipped_logs = summary.get("skipped_logs", [])
+        self._last_output_dirs = summary.output_dirs
+        self._error_logs = summary.error_logs
+        self._skipped_logs = summary.skipped_logs
         self._SetStatistics(
-            total=summary["total"],
-            ok=summary["ok"],
-            failed=summary["failed"],
-            skipped=summary["skipped"],
+            total=summary.total,
+            ok=summary.ok,
+            failed=summary.failed,
+            skipped=summary.skipped,
         )
         self._UpdateLogExportButtons()
 

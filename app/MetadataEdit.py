@@ -14,108 +14,29 @@ from __future__ import annotations
 
 import json
 import os
-import shutil
 import subprocess
-from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Callable
 
-from app.AddCover import AUDIO_EXTENSIONS, IMAGE_EXTENSIONS
+from .audio.models import AudioFormatOption, AudioInfo, CoverExportResult, MetadataField, TrackEdit
+from .audio.formats import (
+    AUDIO_EXTENSIONS, IMAGE_EXTENSIONS, METADATA_FIELDS, TEXT_FIELDS, FORMAT_OPTIONS,
+    CONVERT_FORMATS, WAV_AUTO_CONVERT_TARGETS, DEFAULT_BITRATE, COVER_UNSUPPORTED_EXTENSIONS,
+    TAG_UNSUPPORTED_EXTENSIONS,
+    field_by_key as FieldByKey, format_by_key as FormatByKey, format_display as FormatDisplay,
+)
+from .errors import FfmpegError
+from .ffmpeg_environment import locate_ffprobe
+from .output_files import commit_output, output_transaction, path_key, temporary_path_for, unique_path_for
+from .task_models import FilePlan, ProcessResult
+from .Converter import RunFileProcess
+
+# 过渡类型入口，数据定义归公共模型所有。
+OutputPlan = FilePlan
 
 
 class MetadataError(Exception):
     """元数据编辑相关的可预期错误，消息可直接展示给用户。"""
-
-
-# ---- 字段模型 ---------------------------------------------------------
-
-@dataclass(frozen=True)
-class MetadataField:
-    key: str
-    display_name: str
-    kind: str  # "text" | "artist" | "cover"
-    default_checked: bool
-
-
-METADATA_FIELDS: tuple[MetadataField, ...] = (
-    MetadataField("cover", "封面", "cover", True),
-    MetadataField("title", "标题", "text", True),
-    MetadataField("artist", "作者", "artist", True),
-    MetadataField("album", "专辑", "text", True),
-    MetadataField("album_artist", "专辑艺术家", "text", False),
-    MetadataField("date", "年份", "text", False),
-    MetadataField("track", "音轨号", "text", False),
-    MetadataField("genre", "流派", "text", False),
-    MetadataField("comment", "注释", "text", False),
-)
-
-TEXT_FIELDS: tuple[MetadataField, ...] = tuple(
-    item for item in METADATA_FIELDS if item.kind != "cover"
-)
-
-_FIELDS_BY_KEY = {item.key: item for item in METADATA_FIELDS}
-
-
-def FieldByKey(key: str) -> MetadataField | None:
-    return _FIELDS_BY_KEY.get(key)
-
-
-# ---- 格式转换模型 -----------------------------------------------------
-
-@dataclass(frozen=True)
-class AudioFormatOption:
-    key: str
-    display_name: str
-    extension: str | None          # None 表示保持原格式
-    lossy: bool
-    bitrates: tuple[str, ...] = ()
-    cover_capable: bool = False
-
-
-FORMAT_OPTIONS: tuple[AudioFormatOption, ...] = (
-    AudioFormatOption("keep", "保持原格式", None, False, (), False),
-    AudioFormatOption("mp3", "MP3", ".mp3", True, ("128k", "192k", "256k", "320k"), True),
-    AudioFormatOption("m4a", "M4A (AAC)", ".m4a", True, ("128k", "192k", "256k", "320k"), True),
-    AudioFormatOption("flac", "FLAC", ".flac", False, (), True),
-    AudioFormatOption("ogg", "OGG (Vorbis)", ".ogg", True, ("96k", "128k", "192k", "256k"), False),
-    AudioFormatOption("opus", "OPUS", ".opus", True, ("64k", "96k", "128k", "192k"), False),
-    AudioFormatOption("wav", "WAV (PCM)", ".wav", False, (), False),
-    AudioFormatOption("aac", "AAC (ADTS)", ".aac", True, ("128k", "192k", "256k", "320k"), False),
-)
-
-_FORMATS_BY_KEY = {item.key: item for item in FORMAT_OPTIONS}
-DEFAULT_BITRATE = "192k"
-CONVERT_FORMATS: tuple[AudioFormatOption, ...] = tuple(
-    item for item in FORMAT_OPTIONS if item.key != "keep"
-)
-WAV_AUTO_CONVERT_TARGETS: tuple[AudioFormatOption, ...] = tuple(
-    item for item in FORMAT_OPTIONS if item.cover_capable
-)
-
-# 容器不支持内嵌封面的目标扩展名：写入时自动忽略封面修改并给出警告
-COVER_UNSUPPORTED_EXTENSIONS: frozenset[str] = frozenset(
-    {".wav", ".aac", ".ogg", ".opus"}
-)
-
-# 容器不保存元数据标签的目标扩展名：元数据修改会被静默丢弃，需显式警告
-TAG_UNSUPPORTED_EXTENSIONS: frozenset[str] = frozenset({".aac"})
-
-
-def FormatByKey(key: str | None) -> AudioFormatOption | None:
-    if key is None:
-        return None
-    return _FORMATS_BY_KEY.get(key)
-
-
-def FormatDisplay(original_ext: str, target_format_key: str | None, bitrate: str | None) -> str:
-    """格式列显示文本：无转换为 .mp3；有转换为 .mp3->.m4a 192k（无损无码率）。"""
-    source_ext = original_ext.lower()
-    target = FormatByKey(target_format_key)
-    if target is None or target.key == "keep":
-        return source_ext
-    text = f"{source_ext}->{target.extension}"
-    if target.lossy:
-        text += f" {bitrate or DEFAULT_BITRATE}"
-    return text
 
 
 # ---- 输入收集 ---------------------------------------------------------
@@ -149,37 +70,13 @@ def CollectAudioFiles(folder: str | Path) -> list[Path]:
 
 def LocateFfprobe(ffmpeg_path: str | None = None) -> str:
     """返回 ffprobe 路径：优先与 ffmpeg 同目录，其次 PATH；找不到抛 MetadataError。"""
-    if ffmpeg_path:
-        base = Path(ffmpeg_path)
-        candidate = base.with_name("ffprobe.exe") if os.name == "nt" else base.with_name("ffprobe")
-        if candidate.is_file():
-            return str(candidate)
-    found = shutil.which("ffprobe")
-    if found:
-        return found
-    raise MetadataError("未找到 ffprobe（需要与 ffmpeg 同目录或在 PATH 中）")
+    try:
+        return locate_ffprobe(ffmpeg_path)
+    except FfmpegError as exc:
+        raise MetadataError(str(exc)) from exc
 
 
-@dataclass
-class AudioInfo:
-    """单个音频在磁盘上的元数据快照。"""
-
-    path: Path
-    values: dict[str, str]
-    has_cover: bool
-    cover_codec: str | None
-    error: str | None = None
-
-    @property
-    def file_name(self) -> str:
-        return self.path.name
-
-    @property
-    def original_ext(self) -> str:
-        return self.path.suffix.lower()
-
-
-def _RunFfprobe(ffprobe_path: str, audio_path: Path) -> tuple[bool, str, str]:
+def _RunFfprobe(ffprobe_path: str, audio_path: Path) -> ProcessResult:
     cmd = [
         ffprobe_path,
         "-v",
@@ -198,23 +95,23 @@ def _RunFfprobe(ffprobe_path: str, audio_path: Path) -> tuple[bool, str, str]:
             creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
         )
     except OSError as exc:
-        return False, "", f"无法运行 ffprobe：{exc}"
+        return ProcessResult(-1, f"无法运行 ffprobe：{exc}")
     except subprocess.TimeoutExpired:
-        return False, "", "ffprobe 读取超时"
+        return ProcessResult(-1, "ffprobe 读取超时", timed_out=True)
     if result.returncode != 0:
         lines = (result.stderr or "未知错误").strip().splitlines()
-        return False, "", (lines[-1] if lines else "ffprobe 读取失败")
-    return True, result.stdout, ""
+        return ProcessResult(result.returncode, lines[-1] if lines else "ffprobe 读取失败")
+    return ProcessResult(0, stdout=(result.stdout or "").encode("utf-8"))
 
 
 def ReadAudioInfo(ffprobe_path: str, audio_path: Path) -> AudioInfo:
     """读取音频现有元数据与内嵌封面信息。"""
-    ok, stdout, error = _RunFfprobe(ffprobe_path, audio_path)
-    if not ok:
-        return AudioInfo(audio_path, {}, False, None, error)
+    result = _RunFfprobe(ffprobe_path, audio_path)
+    if not result.succeeded:
+        return AudioInfo(audio_path, {}, False, None, result.stderr)
 
     try:
-        data = json.loads(stdout or "{}")
+        data = json.loads(result.stdout.decode("utf-8", errors="replace") or "{}")
     except json.JSONDecodeError as exc:
         return AudioInfo(audio_path, {}, False, None, f"ffprobe 输出解析失败：{exc}")
 
@@ -289,15 +186,10 @@ def UniquePathFor(
 
     不同目录下的同名音频（如 A/song.mp3 与 B/song.mp3）导出封面到同一目录时，
     若固定用 `<名称>.<扩展名>` 会相互覆盖，导致封面张冠李戴。taken 用于同一批
-    任务内**已被占用但尚未落盘**的输出路径（小写字符串），否则同一批里的同名
+    任务内**已被占用但尚未落盘**的输出路径（由 path_key 生成），否则同一批里的同名
     输出会算出同一个名字。
     """
-    candidate = directory / f"{stem}{suffix}"
-    counter = 1
-    while candidate.exists() or (taken is not None and str(candidate).lower() in taken):
-        candidate = directory / f"{stem} ({counter}){suffix}"
-        counter += 1
-    return candidate
+    return unique_path_for(directory, stem, suffix, taken)
 
 
 def ExtractCoverToFile(
@@ -305,12 +197,13 @@ def ExtractCoverToFile(
     audio_path: Path,
     dest_dir: str | Path,
     cover_codec: str | None,
-) -> tuple[Path | None, str | None]:
-    """把内嵌封面导出为图片文件（尽量复制原编码），返回 (输出路径, 错误)。"""
+    *, cancel_check: Callable[[], bool] | None = None,
+) -> CoverExportResult:
+    """把内嵌封面写入独立临时文件，成功后保存到未占用的正式路径。"""
     output_dir = Path(dest_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
     suffix = CoverSuffixForCodec(cover_codec)
     dest = UniquePathFor(output_dir, audio_path.stem, suffix)
+    temporary = temporary_path_for(dest)
 
     copy_ok = cover_codec in {"mjpeg", "jpeg", "png"}
     cmd = [
@@ -327,80 +220,26 @@ def ExtractCoverToFile(
         "1",
         "-c:v",
         "copy" if copy_ok else "mjpeg",
-        str(dest),
+        str(temporary),
     ]
+    plan = FilePlan(audio_path, dest, temporary, tuple(cmd), overwrite=False)
     try:
-        result = subprocess.run(
-            cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=60,
-            creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
-        )
+        with output_transaction(plan):
+            result = RunFileProcess(plan.command, cancel_check=cancel_check, timeout_seconds=60)
+            if result.cancelled or (cancel_check is not None and cancel_check()):
+                return CoverExportResult(cancelled=True)
+            if not result.succeeded:
+                return CoverExportResult(error=result.stderr or "封面导出失败")
+            if not commit_output(plan):
+                return CoverExportResult(error=f"输出文件已存在：{dest.name}")
     except OSError as exc:
-        return None, f"无法运行 ffmpeg：{exc}"
-    except subprocess.TimeoutExpired:
-        return None, "封面导出超时"
-    if result.returncode != 0:
-        lines = (result.stderr or "未知错误").strip().splitlines()
-        return None, (lines[-1] if lines else "封面导出失败")
-    return dest, None
+        return CoverExportResult(error=f"无法导出封面：{exc}")
+    return CoverExportResult(path=dest)
 
 
 # ---- 内存编辑模型 -----------------------------------------------------
 
-@dataclass
-class TrackEdit:
-    """表格中一行音频的内存态（未确认前不写入）。"""
-
-    path: Path
-    original_ext: str = ""
-    original_values: dict[str, str] = field(default_factory=dict)
-    edited_values: dict[str, str] = field(default_factory=dict)
-    has_original_cover: bool = False
-    cover_codec: str | None = None
-    thumbnail_bytes: bytes | None = None
-    cover_action: str | None = None            # "set" | "remove" | None
-    cover_source: Path | None = None           # set 时的图片文件路径
-    target_format_key: str | None = None       # None 表示保持原格式
-    bitrate: str | None = None
-    backup: bool = False
-    error: str | None = None
-
-    @classmethod
-    def FromAudioInfo(cls, info: AudioInfo) -> "TrackEdit":
-        return cls(
-            path=info.path,
-            original_ext=info.original_ext,
-            original_values=dict(info.values),
-            has_original_cover=info.has_cover,
-            cover_codec=info.cover_codec,
-            error=info.error,
-        )
-
-    @property
-    def file_name(self) -> str:
-        return self.path.name
-
-    @property
-    def modified(self) -> bool:
-        return bool(self.edited_values) or self.cover_action is not None or (
-            self.target_format_key is not None
-        )
-
-    @property
-    def format_display(self) -> str:
-        return FormatDisplay(self.original_ext, self.target_format_key, self.bitrate)
-
-
 # ---- 写入命令构建 -----------------------------------------------------
-
-@dataclass
-class OutputPlan:
-    output_path: Path
-    temp_path: Path
-    command: list[str]
-    converted: bool
-    replaces_source: bool
-    warnings: list[str] = field(default_factory=list)
-
 
 def _AudioEncoderArgs(fmt: AudioFormatOption, bitrate: str | None) -> list[str]:
     if fmt.key == "mp3":
@@ -456,7 +295,7 @@ def BuildOutputPlan(
             # 换扩展名：不覆盖源文件旁的既有文件，重名时改用带序号的名字
             desired = source.with_suffix(target_ext)
             if desired.exists() or (
-                used_outputs is not None and str(desired).lower() in used_outputs
+                used_outputs is not None and path_key(desired) in used_outputs
             ):
                 output_path = UniquePathFor(
                     source.parent, source.stem, target_ext, used_outputs
@@ -473,7 +312,9 @@ def BuildOutputPlan(
         if root.exists() and not root.is_dir():
             raise MetadataError(f"输出路径不是文件夹：{root}")
         desired = root / f"{source.stem}{target_ext}"
-        if used_outputs is not None and str(desired).lower() in used_outputs:
+        if path_key(desired) == path_key(source) or (
+            used_outputs is not None and path_key(desired) in used_outputs
+        ):
             output_path = UniquePathFor(root, source.stem, target_ext, used_outputs)
             warnings.append(f"输出重名，已改为 {output_path.name}")
         else:
@@ -481,9 +322,9 @@ def BuildOutputPlan(
         replaces_source = False
 
     if used_outputs is not None and not replaces_source:
-        used_outputs.add(str(output_path).lower())
+        used_outputs.add(path_key(output_path))
 
-    temp_path = output_path.with_name(f".{output_path.name}.part{output_path.suffix}")
+    temp_path = temporary_path_for(output_path)
 
     cover_action = edit.cover_action
     if cover_action == "set" and target_ext in COVER_UNSUPPORTED_EXTENSIONS:
@@ -552,11 +393,14 @@ def BuildOutputPlan(
         command += ["-id3v2_version", "3"]
 
     command.append(str(temp_path))
-    return OutputPlan(
+    return FilePlan(
+        source_path=source,
+        overwrite=overwrite if not in_place else replaces_source,
+        backup=edit.backup,
         output_path=output_path,
         temp_path=temp_path,
-        command=command,
+        command=tuple(command),
         converted=converting,
         replaces_source=replaces_source,
-        warnings=warnings,
+        warnings=tuple(warnings),
     )

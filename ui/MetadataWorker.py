@@ -1,7 +1,6 @@
 """元数据编辑后台线程：导入读取、确认写入、封面导出。"""
 from __future__ import annotations
 
-import shutil
 import tempfile
 from dataclasses import replace
 from pathlib import Path
@@ -13,12 +12,18 @@ from app.MetadataEdit import (
     BuildOutputPlan,
     ExtractCoverThumbnail,
     ExtractCoverToFile,
-    FormatByKey,
     MetadataError,
     ReadAudioInfo,
-    TrackEdit,
 )
-from ui.Worker import LOG_ERROR, LOG_INFO, LOG_OK, LOG_WARN
+from app.audio.models import TrackEdit
+from app.audio.formats import format_by_key
+from app.output_files import (
+    commit_output, ensure_output_directory, output_transaction,
+    path_key,
+)
+from app.task_models import (
+    LOG_ERROR, LOG_INFO, LOG_OK, LOG_WARN, TaskProgress, TaskResult,
+)
 
 
 class MetadataReadWorker(QThread):
@@ -27,7 +32,7 @@ class MetadataReadWorker(QThread):
     logMessage = pyqtSignal(int, int, str)
     progressChanged = pyqtSignal(int, int, int, str)
     rowLoaded = pyqtSignal(int, object)
-    taskFinished = pyqtSignal(int, dict)
+    taskFinished = pyqtSignal(int, object)
 
     def __init__(
         self,
@@ -46,6 +51,10 @@ class MetadataReadWorker(QThread):
 
     def RequestCancel(self) -> None:
         self._cancel_requested = True
+
+    def _Progress(self, done: int, total: int, current_file: str) -> None:
+        progress = TaskProgress(done, total, current_file)
+        self.progressChanged.emit(self._thread_id, progress.done, progress.total, progress.current_file)
 
     def run(self) -> None:
         total = len(self._files)
@@ -68,25 +77,25 @@ class MetadataReadWorker(QThread):
                 failed_count += 1
                 self._Log(LOG_WARN, f"{path.name}：{info.error}")
 
-            edit = TrackEdit.FromAudioInfo(info)
+            edit = TrackEdit.from_audio_info(info)
             if info.error is None and info.has_cover:
                 thumbnail = ExtractCoverThumbnail(self._ffmpeg_path, path)
                 edit.thumbnail_bytes = thumbnail
 
             self.rowLoaded.emit(self._thread_id, edit)
-            self.progressChanged.emit(self._thread_id, done, total, path.name)
+            self._Progress(done, total, path.name)
 
         self._Log(
             LOG_INFO,
             f"导入结束：成功读取 {ok_count}，失败 {failed_count}"
             + ("（已取消）" if cancelled else ""),
         )
-        self.taskFinished.emit(self._thread_id, {
-            "total": total,
-            "ok": ok_count,
-            "failed": failed_count,
-            "cancelled": cancelled,
-        })
+        self.taskFinished.emit(self._thread_id, TaskResult(
+            total=total,
+            ok=ok_count,
+            failed=failed_count,
+            cancelled=cancelled,
+        ))
 
     def _Log(self, level: int, text: str) -> None:
         self.logMessage.emit(self._thread_id, level, text)
@@ -99,13 +108,13 @@ class MetadataWriteWorker(QThread):
     - logMessage(int 线程号, int 级别, str 文本)
     - progressChanged(int 线程号, int 已完成, int 总数, str 当前文件)
     - statisticsChanged(int 线程号, int 总数, int 成功, int 失败, int 跳过, int 已完成)
-    - taskFinished(int 线程号, dict 汇总)
+    - taskFinished(int 线程号, TaskResult 汇总)
     """
 
     logMessage = pyqtSignal(int, int, str)
     progressChanged = pyqtSignal(int, int, int, str)
     statisticsChanged = pyqtSignal(int, int, int, int, int, int)
-    taskFinished = pyqtSignal(int, dict)
+    taskFinished = pyqtSignal(int, object)
 
     def __init__(
         self,
@@ -135,6 +144,10 @@ class MetadataWriteWorker(QThread):
     def _Log(self, level: int, text: str) -> None:
         self.logMessage.emit(self._thread_id, level, text)
 
+    def _Progress(self, done: int, total: int, current_file: str) -> None:
+        progress = TaskProgress(done, total, current_file)
+        self.progressChanged.emit(self._thread_id, progress.done, progress.total, progress.current_file)
+
     def run(self) -> None:
         total = len(self._edits)
         done = 0
@@ -157,7 +170,7 @@ class MetadataWriteWorker(QThread):
             f"写入方式 {'原地修改' if self._in_place else '输出到新文件'}",
         )
 
-        used_outputs: set[str] = set()
+        used_outputs = {path_key(edit.path) for edit in self._edits}
 
         with tempfile.TemporaryDirectory(prefix="meta_covers_") as cover_temp_dir:
             for edit in self._edits:
@@ -170,21 +183,26 @@ class MetadataWriteWorker(QThread):
                 # 格式转换但未改封面时，保留原内嵌封面：先提取出来再作为新封面写入。
                 # 用副本传参，避免把提取结果写回界面的内存态。
                 plan_edit = edit
-                fmt = FormatByKey(edit.target_format_key)
+                fmt = format_by_key(edit.target_format_key)
                 converting = fmt is not None and fmt.key != "keep"
                 if edit.cover_action is None and converting and edit.has_original_cover:
-                    extracted, error = ExtractCoverToFile(
-                        self._ffmpeg_path, edit.path, cover_temp_dir, edit.cover_codec
+                    extraction = ExtractCoverToFile(
+                        self._ffmpeg_path, edit.path, cover_temp_dir, edit.cover_codec,
+                        cancel_check=self._CancelCheck,
                     )
-                    if extracted is not None:
+                    if extraction.cancelled:
+                        cancelled = True
+                        done -= 1
+                        break
+                    if extraction.path is not None:
                         plan_edit = replace(
-                            edit, cover_action="set", cover_source=extracted
+                            edit, cover_action="set", cover_source=extraction.path
                         )
                     else:
                         self._Log(
                             LOG_WARN,
                             f"{edit.file_name}：格式转换时提取原封面失败"
-                            f"（{error}），输出文件可能不含封面",
+                            f"（{extraction.error}），输出文件可能不含封面",
                         )
 
                 try:
@@ -201,76 +219,54 @@ class MetadataWriteWorker(QThread):
                     message = f"{edit.file_name}：{exc}"
                     error_logs.append(message)
                     self._Log(LOG_ERROR, message)
-                    self.progressChanged.emit(
-                        self._thread_id, done, total, edit.file_name
-                    )
+                    self._Progress(done, total, edit.file_name)
                     emit_statistics()
                     continue
 
                 for warning in plan.warnings:
                     self._Log(LOG_WARN, f"{edit.file_name}：{warning}")
 
-                if not plan.replaces_source and plan.output_path.exists() and not self._overwrite:
+                if not plan.replaces_source and plan.output_path.exists() and not plan.overwrite:
                     skipped_count += 1
                     message = f"已跳过（输出文件已存在）：{plan.output_path.name}"
                     skipped_logs.append(message)
                     self._Log(LOG_WARN, message)
-                    self.progressChanged.emit(self._thread_id, done, total, edit.file_name)
+                    self._Progress(done, total, edit.file_name)
                     emit_statistics()
                     continue
-
-                plan.output_path.parent.mkdir(parents=True, exist_ok=True)
-                if str(plan.output_path.parent) not in output_dirs:
-                    output_dirs.append(str(plan.output_path.parent))
 
                 try:
-                    plan.temp_path.unlink(missing_ok=True)
-                except OSError as exc:
+                    with output_transaction(plan):
+                        if str(plan.output_path.parent) not in output_dirs:
+                            output_dirs.append(str(plan.output_path.parent))
+                        result = RunFileProcess(plan.command, cancel_check=self._CancelCheck)
+                        if result.cancelled or self._cancel_requested:
+                            cancelled = True
+                            done -= 1
+                            break
+                        if not result.succeeded:
+                            failed_count += 1
+                            message = f"{edit.file_name} 处理失败：{result.stderr or 'ffmpeg 返回未知错误'}"
+                            error_logs.append(message)
+                            self._Log(LOG_ERROR, message)
+                        elif commit_output(plan):
+                            if plan.replaces_source and plan.backup:
+                                self._Log(LOG_INFO, f"{edit.file_name}：已备份到 {edit.path.name}.bak")
+                            ok_count += 1
+                            action = "转换并写入" if plan.converted else "已修改"
+                            self._Log(LOG_OK, f"{edit.file_name} → {plan.output_path.name} {action}")
+                        else:
+                            skipped_count += 1
+                            message = f"已跳过（输出文件已存在）：{plan.output_path.name}"
+                            skipped_logs.append(message)
+                            self._Log(LOG_WARN, message)
+                except Exception as exc:  # noqa: BLE001 -- 清理临时文件后汇报本文件失败
                     failed_count += 1
-                    message = f"{edit.file_name}：无法清理临时文件：{exc}"
+                    message = f"{edit.file_name}：无法保存输出文件：{exc}"
                     error_logs.append(message)
                     self._Log(LOG_ERROR, message)
-                    self.progressChanged.emit(self._thread_id, done, total, edit.file_name)
-                    emit_statistics()
-                    continue
 
-                return_code, error_tail, was_cancelled = RunFileProcess(
-                    plan.command, cancel_check=self._CancelCheck
-                )
-                if was_cancelled:
-                    plan.temp_path.unlink(missing_ok=True)
-                    cancelled = True
-                    done -= 1
-                    break
-
-                if return_code != 0:
-                    plan.temp_path.unlink(missing_ok=True)
-                    failed_count += 1
-                    detail = error_tail or "ffmpeg 返回未知错误"
-                    message = f"{edit.file_name} 处理失败：{detail}"
-                    error_logs.append(message)
-                    self._Log(LOG_ERROR, message)
-                else:
-                    try:
-                        if plan.replaces_source and edit.backup:
-                            backup_path = edit.path.with_name(edit.path.name + ".bak")
-                            shutil.copy2(edit.path, backup_path)
-                            self._Log(LOG_INFO, f"{edit.file_name}：已备份到 {backup_path.name}")
-                        plan.temp_path.replace(plan.output_path)
-                        ok_count += 1
-                        action = "转换并写入" if plan.converted else "已修改"
-                        self._Log(
-                            LOG_OK,
-                            f"{edit.file_name} → {plan.output_path.name} {action}",
-                        )
-                    except OSError as exc:
-                        plan.temp_path.unlink(missing_ok=True)
-                        failed_count += 1
-                        message = f"{edit.file_name}：无法保存输出文件：{exc}"
-                        error_logs.append(message)
-                        self._Log(LOG_ERROR, message)
-
-                self.progressChanged.emit(self._thread_id, done, total, edit.file_name)
+                self._Progress(done, total, edit.file_name)
                 emit_statistics()
 
         if cancelled:
@@ -282,16 +278,16 @@ class MetadataWriteWorker(QThread):
             )
 
         emit_statistics()
-        self.taskFinished.emit(self._thread_id, {
-            "total": total,
-            "ok": ok_count,
-            "failed": failed_count,
-            "skipped": skipped_count,
-            "cancelled": cancelled,
-            "output_dirs": output_dirs,
-            "error_logs": error_logs,
-            "skipped_logs": skipped_logs,
-        })
+        self.taskFinished.emit(self._thread_id, TaskResult(
+            total=total,
+            ok=ok_count,
+            failed=failed_count,
+            skipped=skipped_count,
+            cancelled=cancelled,
+            output_dirs=output_dirs,
+            error_logs=error_logs,
+            skipped_logs=skipped_logs,
+        ))
 
 
 class CoverExportWorker(QThread):
@@ -299,7 +295,7 @@ class CoverExportWorker(QThread):
 
     logMessage = pyqtSignal(int, int, str)
     progressChanged = pyqtSignal(int, int, int, str)
-    taskFinished = pyqtSignal(int, dict)
+    taskFinished = pyqtSignal(int, object)
 
     def __init__(
         self,
@@ -322,6 +318,10 @@ class CoverExportWorker(QThread):
     def _Log(self, level: int, text: str) -> None:
         self.logMessage.emit(self._thread_id, level, text)
 
+    def _Progress(self, done: int, total: int, current_file: str) -> None:
+        progress = TaskProgress(done, total, current_file)
+        self.progressChanged.emit(self._thread_id, progress.done, progress.total, progress.current_file)
+
     def run(self) -> None:
         total = len(self._items)
         done = 0
@@ -332,13 +332,14 @@ class CoverExportWorker(QThread):
         output_dir = Path(self._output_dir)
 
         try:
-            output_dir.mkdir(parents=True, exist_ok=True)
+            ensure_output_directory(output_dir)
         except OSError as exc:
             self._Log(LOG_ERROR, f"无法创建输出目录：{exc}")
-            self.taskFinished.emit(self._thread_id, {
-                "total": total, "ok": 0, "skipped": 0, "failed": 0,
-                "cancelled": False, "output_dir": str(output_dir),
-            })
+            self.taskFinished.emit(self._thread_id, TaskResult(
+                total=total, ok=0, skipped=0, failed=total,
+                error_logs=[f"无法创建输出目录：{exc}"],
+                cancelled=False, output_dirs=[str(output_dir)],
+            ))
             return
 
         for path, cover_codec in self._items:
@@ -350,27 +351,32 @@ class CoverExportWorker(QThread):
                 skipped_count += 1
                 self._Log(LOG_WARN, f"{path.name}：无内嵌封面，跳过")
             else:
-                _dest, error = ExtractCoverToFile(
-                    self._ffmpeg_path, path, output_dir, cover_codec
+                extraction = ExtractCoverToFile(
+                    self._ffmpeg_path, path, output_dir, cover_codec,
+                    cancel_check=lambda: self._cancel_requested,
                 )
-                if error is None:
+                if extraction.cancelled:
+                    cancelled = True
+                    done -= 1
+                    break
+                if extraction.error is None:
                     ok_count += 1
                     self._Log(LOG_OK, f"{path.name}：封面已导出")
                 else:
                     failed_count += 1
-                    self._Log(LOG_ERROR, f"{path.name}：{error}")
-            self.progressChanged.emit(self._thread_id, done, total, path.name)
+                    self._Log(LOG_ERROR, f"{path.name}：{extraction.error}")
+            self._Progress(done, total, path.name)
 
         self._Log(
             LOG_INFO,
             f"封面导出结束：成功 {ok_count}，跳过 {skipped_count}，失败 {failed_count}"
             + ("（已取消）" if cancelled else ""),
         )
-        self.taskFinished.emit(self._thread_id, {
-            "total": total,
-            "ok": ok_count,
-            "skipped": skipped_count,
-            "failed": failed_count,
-            "cancelled": cancelled,
-            "output_dir": str(output_dir),
-        })
+        self.taskFinished.emit(self._thread_id, TaskResult(
+            total=total,
+            ok=ok_count,
+            skipped=skipped_count,
+            failed=failed_count,
+            cancelled=cancelled,
+            output_dirs=[str(output_dir)],
+        ))

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from .image.models import Batch, ConvertOptions
+from .output_files import path_key, unique_path_for
 from datetime import datetime
 from pathlib import Path
 
@@ -42,29 +43,6 @@ class InputError(Exception):
     """输入路径不符合处理规则时抛出，消息可直接展示给用户。"""
 
 
-@dataclass
-class ConvertOptions:
-    ffmpeg_path: str
-    target_extension: str | None = None   # None 表示保持原格式
-    quality: int | None = 80              # 1~100，仅对有损编码有效
-    max_dimension: int = 0                # 0 表示不缩放
-    overwrite: bool = True                # 输出文件已存在时是否覆盖
-
-
-@dataclass
-class Batch:
-    """一批待处理文件：folder 下的所有 files 统一输出到 output_dir。
-
-    base_name：输出子目录的基础名（不带 _output 后缀）。
-    单文件（规则 A）为文件名去后缀；目录整批（规则 B）为文件夹名。
-    """
-
-    folder: Path
-    output_dir: Path
-    files: list[Path]
-    base_name: str | None = None
-
-
 def BuildBatchesForInputs(
     input_paths: list[str | Path],
     include_output_dirs: bool = False,
@@ -95,6 +73,10 @@ def BuildBatchesForInputs(
         parents = {path.resolve().parent for path in paths}
         if len(parents) != 1:
             raise InputError("多选文件必须位于同一个文件夹内")
+
+        if len(paths) == 1:
+            batches = BuildBatches(paths[0], include_output_dirs=include_output_dirs)
+            return RelocateBatchOutputs(batches, output_root) if output_root is not None else batches
 
         parent = paths[0].parent
         root = Path(output_root) if output_root is not None else parent
@@ -207,16 +189,12 @@ def RelocateBatchOutputs(batches: list[Batch], output_root: str | Path) -> list[
     for batch in batches:
         base = batch.base_name or batch.folder.name
         output_name = f"{base}{OUTPUT_SUFFIX}"
-        if output_name.lower() in used_dirs:
-            counter = 1
-            while f"{output_name} ({counter})".lower() in used_dirs:
-                counter += 1
-            output_name = f"{output_name} ({counter})"
-        used_dirs.add(output_name.lower())
+        output_path = unique_path_for(root, output_name, "", used_dirs, include_existing=False)
+        used_dirs.add(path_key(output_path))
         relocated.append(
             Batch(
                 folder=batch.folder,
-                output_dir=root / output_name,
+                output_dir=output_path,
                 files=batch.files,
                 base_name=batch.base_name,
             )

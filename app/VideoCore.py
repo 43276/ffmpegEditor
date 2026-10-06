@@ -1,11 +1,12 @@
 """视频压缩的输入规则、批次规划与 FFmpeg 命令构建。"""
 from __future__ import annotations
 
-from dataclasses import dataclass
+from .video.models import VideoBatch, VideoCompressOptions
 from datetime import datetime
 from pathlib import Path
 
-from app.Converter import ConverterError, FfmpegCapabilities
+from app.errors import FfmpegError as ConverterError
+from app.ffmpeg_environment import FfmpegCapabilities
 
 OUTPUT_SUFFIX = "_output"
 SUPPORTED_VIDEO_EXTENSIONS = {
@@ -15,23 +16,6 @@ SUPPORTED_VIDEO_EXTENSIONS = {
 
 class VideoInputError(Exception):
     """输入不符合视频处理规则时抛出，消息可直接展示给用户。"""
-
-
-@dataclass
-class VideoBatch:
-    folder: Path
-    output_dir: Path
-    files: list[Path]
-
-
-@dataclass
-class VideoCompressOptions:
-    ffmpeg_path: str
-    encoder: str = "libx264"
-    crf: int = 23
-    preset: str = "medium"
-    audio_bitrate: str = "192k"
-    overwrite: bool = True
 
 
 def IsVideoFile(path: Path) -> bool:

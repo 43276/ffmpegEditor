@@ -15,12 +15,13 @@ from qfluentwidgets import (
 )
 from qfluentwidgets.common.style_sheet import isDarkTheme
 
-from app.Converter import FfmpegCapabilities
-from app.VideoCore import BuildVideoBatchesForInputs, SummarizeVideoBatches, VideoCompressOptions, VideoInputError
+from app.ffmpeg_environment import FfmpegCapabilities
+from app.VideoCore import BuildVideoBatchesForInputs, SummarizeVideoBatches, VideoInputError
+from app.video.models import VideoCompressOptions
 from ui.Controls import MakeSwitchButton
 from ui.SmoothScroll import SmoothScrollArea as ScrollArea
 from ui.VideoWorker import VideoCompressWorker
-from ui.Worker import LOG_ERROR, LOG_INFO, LOG_OK, LOG_WARN
+from app.task_models import LOG_ERROR, LOG_INFO, LOG_OK, LOG_WARN, TaskResult
 
 _LOG_COLORS = {LOG_OK: ("#0f7b0f", "#7adfa0"), LOG_WARN: ("#9a6700", "#f5c26b"), LOG_ERROR: ("#c42b1c", "#ff9aa2")}
 _LEVEL_MARKS = {LOG_OK: "✓ ", LOG_WARN: "⚠ ", LOG_ERROR: "✗ "}
@@ -292,21 +293,21 @@ class VideoPage(QWidget):
         if not self._cancel_requested and not self._finish_requested:
             self.status.setText(f"进度 {done}/{total}：{current}")
 
-    def _Finished(self, summary: dict) -> None:
-        self._last_output_dirs = summary["output_dirs"]
-        self._SetStatistics(summary["total"], summary["ok"], summary["failed"], summary["skipped"])
-        if summary["cancelled"]:
+    def _Finished(self, summary: TaskResult) -> None:
+        self._last_output_dirs = summary.output_dirs
+        self._SetStatistics(summary.total, summary.ok, summary.failed, summary.skipped)
+        if summary.cancelled:
             self.status.setText("已取消")
             self._ShowInfo("任务已取消", "本次压缩已中止")
-        elif summary["early_stopped"]:
+        elif summary.early_stopped:
             self.status.setText("已结束：当前文件夹已完成")
             self._ShowInfo("已按“结束”停止", "当前文件夹已完成，后续文件夹未开始", warning=True)
-        elif summary["failed"]:
-            self.status.setText(f"压缩完成：成功 {summary['ok']}，失败 {summary['failed']}，跳过 {summary['skipped']}")
-            self._ShowInfo("压缩完成（有失败项）", f"成功 {summary['ok']}，失败 {summary['failed']}，跳过 {summary['skipped']}", warning=True)
+        elif summary.failed:
+            self.status.setText(f"压缩完成：成功 {summary.ok}，失败 {summary.failed}，跳过 {summary.skipped}")
+            self._ShowInfo("压缩完成（有失败项）", f"成功 {summary.ok}，失败 {summary.failed}，跳过 {summary.skipped}", warning=True)
         else:
-            self.status.setText(f"压缩完成：成功 {summary['ok']}，跳过 {summary['skipped']}")
-            self._ShowInfo("压缩完成", f"成功 {summary['ok']} 个视频，跳过 {summary['skipped']}")
+            self.status.setText(f"压缩完成：成功 {summary.ok}，跳过 {summary.skipped}")
+            self._ShowInfo("压缩完成", f"成功 {summary.ok} 个视频，跳过 {summary.skipped}")
 
     def _WorkerStopped(self) -> None:
         self._worker = None

@@ -44,7 +44,8 @@ from qfluentwidgets import (
 )
 from qfluentwidgets.common.style_sheet import isDarkTheme
 
-from app.AddCover import AUDIO_EXTENSIONS, IMAGE_EXTENSIONS
+from app.audio.formats import AUDIO_EXTENSIONS, IMAGE_EXTENSIONS
+from app.audio.models import TrackEdit
 from app.MetadataEdit import (
     DEFAULT_BITRATE,
     FORMAT_OPTIONS,
@@ -57,12 +58,11 @@ from app.MetadataEdit import (
     FormatDisplay,
     LocateFfprobe,
     MetadataError,
-    TrackEdit,
 )
 from ui.Controls import MakeSwitchButton
 from ui.SmoothScroll import SmoothScrollArea as ScrollArea
 from ui.MetadataWorker import CoverExportWorker, MetadataReadWorker, MetadataWriteWorker
-from ui.Worker import LOG_ERROR, LOG_INFO, LOG_OK, LOG_WARN
+from app.task_models import LOG_ERROR, LOG_INFO, LOG_OK, LOG_WARN, TaskResult
 
 _LOG_COLORS = {
     LOG_OK: ("#0f7b0f", "#7adfa0"),
@@ -404,12 +404,12 @@ class _CoverDialog(QDialog):
     def _OnExportProgress(self, _thread_id: int, done: int, total: int, name: str) -> None:
         self.status_label.setText(f"正在提取全部封面 {done}/{total}：{name}")
 
-    def _OnExportFinished(self, _thread_id: int, summary: dict) -> None:
+    def _OnExportFinished(self, _thread_id: int, summary: TaskResult) -> None:
         self._export_worker = None
         self._SetExporting(False)
         self.status_label.setText(
-            f"导出完成：成功 {summary['ok']}，跳过 {summary['skipped']}，"
-            f"失败 {summary['failed']} → {summary['output_dir']}"
+            f"导出完成：成功 {summary.ok}，跳过 {summary.skipped}，"
+            f"失败 {summary.failed} → {summary.output_dir}"
         )
 
     def _SetExporting(self, exporting: bool) -> None:
@@ -471,7 +471,7 @@ class MetadataPage(QWidget):
         self._ffprobe_path: str | None = None
         self._read_worker: MetadataReadWorker | None = None
         self._workers: list[MetadataWriteWorker] = []
-        self._worker_summaries: dict[int, dict] = {}
+        self._worker_summaries: dict[int, TaskResult] = {}
         self._thread_progress: dict[int, tuple[int, int]] = {}
         self._planned_total = 0
         self._live_statistics = {"total": 0, "ok": 0, "failed": 0, "skipped": 0}
@@ -829,20 +829,20 @@ class MetadataPage(QWidget):
         self.progress_bar.setValue(done)
         self.status_label.setText(f"正在导入 {done}/{total}：{name}")
 
-    def _OnReadTaskFinished(self, _thread_id: int, summary: dict) -> None:
+    def _OnReadTaskFinished(self, _thread_id: int, summary: TaskResult) -> None:
         self._read_worker = None
         self._UpdateControls()
         if self._closing:
             return
         self.progress_bar.setValue(self.progress_bar.maximum())
-        if summary.get("failed"):
+        if summary.failed:
             self._ShowInfoBar(
                 "导入完成（部分失败）",
-                f"成功 {summary['ok']}，失败 {summary['failed']}",
+                f"成功 {summary.ok}，失败 {summary.failed}",
                 warning=True,
             )
         else:
-            self._ShowInfoBar("导入完成", f"共读取 {summary['ok']} 个文件")
+            self._ShowInfoBar("导入完成", f"共读取 {summary.ok} 个文件")
         self.status_label.setText(f"共 {len(self._rows)} 个文件")
         self._SetDefaultOutputRoot()
 
@@ -1269,59 +1269,36 @@ class MetadataPage(QWidget):
     ) -> None:
         self._SetStatistics(total=total, ok=ok, failed=failed, skipped=skipped)
 
-    def _OnWorkerTaskFinished(self, thread_id: int, summary: dict) -> None:
+    def _OnWorkerTaskFinished(self, thread_id: int, summary: TaskResult) -> None:
         self._worker_summaries[thread_id] = summary
         if self._workers and len(self._worker_summaries) >= len(self._workers):
             self._OnAllWorkersFinished(self._MergeSummaries())
 
-    def _MergeSummaries(self) -> dict:
-        merged = {
-            "total": 0,
-            "ok": 0,
-            "failed": 0,
-            "skipped": 0,
-            "cancelled": False,
-            "output_dirs": [],
-            "error_logs": [],
-            "skipped_logs": [],
-        }
-        seen_dirs: set[str] = set()
-        for summary in self._worker_summaries.values():
-            merged["total"] += summary["total"]
-            merged["ok"] += summary["ok"]
-            merged["failed"] += summary["failed"]
-            merged["skipped"] += summary["skipped"]
-            merged["cancelled"] = merged["cancelled"] or summary["cancelled"]
-            merged["error_logs"].extend(summary.get("error_logs", []))
-            merged["skipped_logs"].extend(summary.get("skipped_logs", []))
-            for directory in summary["output_dirs"]:
-                if directory not in seen_dirs:
-                    seen_dirs.add(directory)
-                    merged["output_dirs"].append(directory)
-        return merged
+    def _MergeSummaries(self) -> TaskResult:
+        return TaskResult.merge(self._worker_summaries.values())
 
-    def _OnAllWorkersFinished(self, summary: dict) -> None:
-        if summary["cancelled"]:
+    def _OnAllWorkersFinished(self, summary: TaskResult) -> None:
+        if summary.cancelled:
             self._ShowInfoBar("写入已取消", "部分文件可能未修改", warning=True)
-        elif summary["failed"]:
+        elif summary.failed:
             self._ShowInfoBar(
                 "写入完成（有失败项）",
-                f"成功 {summary['ok']}，失败 {summary['failed']}，跳过 {summary['skipped']}",
+                f"成功 {summary.ok}，失败 {summary.failed}，跳过 {summary.skipped}",
                 warning=True,
             )
         else:
             self._ShowInfoBar(
-                "写入完成", f"成功 {summary['ok']}，跳过 {summary['skipped']}"
+                "写入完成", f"成功 {summary.ok}，跳过 {summary.skipped}"
             )
-        self._last_output_dirs = summary.get("output_dirs", [])
+        self._last_output_dirs = summary.output_dirs
         for directory in self._last_output_dirs[:5]:
             self._AppendLog(LOG_INFO, f"输出目录：{directory}")
-        self._error_logs = summary.get("error_logs", [])
+        self._error_logs = summary.error_logs
         self._SetStatistics(
-            total=summary["total"],
-            ok=summary["ok"],
-            failed=summary["failed"],
-            skipped=summary["skipped"],
+            total=summary.total,
+            ok=summary.ok,
+            failed=summary.failed,
+            skipped=summary.skipped,
         )
         self._UpdateLogExportButtons()
 

@@ -38,21 +38,21 @@ from qfluentwidgets import (
 )
 from qfluentwidgets.common.style_sheet import isDarkTheme
 
-from app.Converter import (
-    FfmpegCapabilities,
-)
+from app.ffmpeg_environment import FfmpegCapabilities
+from app.image.commands import supports_image_format
 from app.Core import (
     BuildBatchesForInputs,
-    ConvertOptions,
     InputError,
     IsLosslessExtension,
     SummarizeBatches,
     TARGET_FORMAT_OPTIONS,
     MakeTaskOutputName,
 )
+from app.image.models import ConvertOptions
 from ui.Controls import MakeSwitchButton
 from ui.SmoothScroll import SmoothScrollArea as ScrollArea
-from ui.Worker import LOG_ERROR, LOG_INFO, LOG_OK, LOG_WARN, ConvertWorker
+from app.task_models import LOG_ERROR, LOG_INFO, LOG_OK, LOG_WARN, TaskResult
+from ui.Worker import ConvertWorker
 
 # 深浅主题下的日志颜色
 _LOG_COLORS = {
@@ -76,7 +76,7 @@ class ImagePage(QWidget):
         self._caps: FfmpegCapabilities | None = None
         self._active_ffmpeg_path: str | None = None
         self._workers: list[ConvertWorker] = []
-        self._worker_summaries: dict[int, dict] = {}
+        self._worker_summaries: dict[int, TaskResult] = {}
         self._thread_progress: dict[int, tuple[int, int]] = {}
         self._planned_total = 0
         self._input_paths: list[Path] = []
@@ -517,8 +517,8 @@ class ImagePage(QWidget):
     def _UpdateFormatCombo(self) -> None:
         if self._caps is None:
             return
-        self._DisableUnavailableFormat(".avif", self._caps.avif_ok, "AVIF")
-        self._DisableUnavailableFormat(".gif", self._caps.gif_ok, "GIF")
+        self._DisableUnavailableFormat(".avif", supports_image_format(self._caps, ".avif"), "AVIF")
+        self._DisableUnavailableFormat(".gif", supports_image_format(self._caps, ".gif"), "GIF")
 
     def _DisableUnavailableFormat(self, extension: str, available: bool, name: str) -> None:
         """目标格式在当前 ffmpeg 不可用时置灰；若正被选中则回退到“保持原格式”。"""
@@ -646,78 +646,51 @@ class ImagePage(QWidget):
     ) -> None:
         self._SetStatistics(total=total, ok=ok, failed=failed, skipped=skipped)
 
-    def _OnWorkerTaskFinished(self, thread_id: int, summary: dict) -> None:
+    def _OnWorkerTaskFinished(self, thread_id: int, summary: TaskResult) -> None:
         """收集各线程的汇总；全部线程结束后统一收尾。"""
         self._worker_summaries[thread_id] = summary
         if self._workers and len(self._worker_summaries) >= len(self._workers):
             self._OnAllWorkersFinished(self._MergeSummaries())
 
-    def _MergeSummaries(self) -> dict:
-        merged = {
-            "total": 0,
-            "ok": 0,
-            "failed": 0,
-            "skipped": 0,
-            "cancelled": False,
-            "early_stopped": False,
-            "output_dirs": [],
-            "error_logs": [],
-            "skipped_logs": [],
-        }
-        seen_dirs: set[str] = set()
-        for summary in self._worker_summaries.values():
-            merged["total"] += summary["total"]
-            merged["ok"] += summary["ok"]
-            merged["failed"] += summary["failed"]
-            merged["skipped"] += summary["skipped"]
-            merged["cancelled"] = merged["cancelled"] or summary["cancelled"]
-            merged["early_stopped"] = (
-                merged["early_stopped"] or summary["early_stopped"]
-            )
-            merged["error_logs"].extend(summary.get("error_logs", []))
-            merged["skipped_logs"].extend(summary.get("skipped_logs", []))
-            for directory in summary["output_dirs"]:
-                if directory not in seen_dirs:
-                    seen_dirs.add(directory)
-                    merged["output_dirs"].append(directory)
-        return merged
+    def _MergeSummaries(self) -> TaskResult:
+        return TaskResult.merge(self._worker_summaries.values())
 
-    def _OnAllWorkersFinished(self, summary: dict) -> None:
-        if summary["cancelled"]:
+    def _OnAllWorkersFinished(self, summary: TaskResult) -> None:
+        if summary.cancelled:
             self._ShowInfoBar("任务已取消", "本次处理被手动中止", error=False, warning=True)
-        elif summary["early_stopped"]:
+        elif summary.early_stopped:
             self._ShowInfoBar(
                 "已按“结束”停止",
-                f"完成当前文件夹后停止：成功 {summary['ok']}，失败 {summary['failed']}，"
-                f"跳过 {summary['skipped']}；剩余文件夹未处理",
+                f"完成当前文件夹后停止：成功 {summary.ok}，失败 {summary.failed}，"
+                f"跳过 {summary.skipped}；剩余文件夹未处理",
                 warning=True,
             )
-        elif summary["failed"]:
+        elif summary.failed:
             self._ShowInfoBar(
                 "处理完成（有失败项）",
-                f"成功 {summary['ok']}，失败 {summary['failed']}，跳过 {summary['skipped']}",
+                f"成功 {summary.ok}，失败 {summary.failed}，跳过 {summary.skipped}",
                 warning=True,
             )
         else:
             self._ShowInfoBar(
                 "处理完成",
-                f"成功 {summary['ok']} 个文件，跳过 {summary['skipped']}",
+                f"成功 {summary.ok} 个文件，跳过 {summary.skipped}",
             )
-        self._last_output_dirs = summary["output_dirs"]
-        self._error_logs = summary.get("error_logs", [])
-        self._skipped_logs = summary.get("skipped_logs", [])
+        self._last_output_dirs = summary.output_dirs
+        self._error_logs = summary.error_logs
+        self._skipped_logs = summary.skipped_logs
         self._SetStatistics(
-            total=summary["total"],
-            ok=summary["ok"],
-            failed=summary["failed"],
-            skipped=summary["skipped"],
+            total=summary.total,
+            ok=summary.ok,
+            failed=summary.failed,
+            skipped=summary.skipped,
         )
         self._UpdateLogExportButtons()
 
         # 任务真正全部结束后（取消 / 提前结束都不算完成）才考虑自动关机
         if (
-            not summary["cancelled"]
-            and not summary["early_stopped"]
+            not summary.cancelled
+            and not summary.early_stopped
             and self.auto_shutdown_switch.isChecked()
         ):
             self._ScheduleShutdown()

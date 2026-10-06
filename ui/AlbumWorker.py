@@ -1,13 +1,18 @@
 """专辑批处理后台线程"""
 from __future__ import annotations
 
-from pathlib import Path
-
 from PyQt6.QtCore import QThread, pyqtSignal
 
-from app.AddCover import AlbumPlan, BuildFfmpegCommand, OutputPathFor
+from app.AddCover import BuildFfmpegCommand, OutputPathFor
+from app.audio.models import AlbumPlan
 from app.Converter import RunFileProcess
-from ui.Worker import LOG_ERROR, LOG_INFO, LOG_OK, LOG_WARN
+from app.output_files import (
+    commit_output, ensure_output_directory, output_transaction,
+    path_key, reserve_output_path, temporary_path_for,
+)
+from app.task_models import (
+    LOG_ERROR, LOG_INFO, LOG_OK, LOG_WARN, FilePlan, TaskProgress, TaskResult,
+)
 
 
 class AlbumWorker(QThread):
@@ -17,13 +22,13 @@ class AlbumWorker(QThread):
     - logMessage(int 线程号, int 级别, str 文本)
     - progressChanged(int 线程号, int 已完成, int 总数, str 当前文件)
     - statisticsChanged(int 线程号, int 总数, int 成功, int 失败, int 跳过, int 已完成)
-    - taskFinished(int 线程号, dict 汇总)
+    - taskFinished(int 线程号, TaskResult 汇总)
     """
 
     logMessage = pyqtSignal(int, int, str)
     progressChanged = pyqtSignal(int, int, int, str)
     statisticsChanged = pyqtSignal(int, int, int, int, int, int)
-    taskFinished = pyqtSignal(int, dict)
+    taskFinished = pyqtSignal(int, object)
 
     def __init__(
         self,
@@ -55,6 +60,10 @@ class AlbumWorker(QThread):
     def _Log(self, level: int, text: str) -> None:
         self.logMessage.emit(self._thread_id, level, text)
 
+    def _Progress(self, done: int, total: int, current_file: str) -> None:
+        progress = TaskProgress(done, total, current_file)
+        self.progressChanged.emit(self._thread_id, progress.done, progress.total, progress.current_file)
+
     def run(self) -> None:
         plan = self._plan
         overwrite = self._overwrite
@@ -65,6 +74,7 @@ class AlbumWorker(QThread):
         skipped_count = 0
         cancelled = False
         early_stopped = False
+        used_outputs = {path_key(source) for task in plan.tasks for group in task.groups for source in group.files}
         output_dirs: list[str] = []
         error_logs: list[str] = []
         skipped_logs: list[str] = []
@@ -109,7 +119,7 @@ class AlbumWorker(QThread):
                     if self._cancel_requested:
                         cancelled = True
                         break
-                    group.output_dir.mkdir(parents=True, exist_ok=True)
+                    ensure_output_directory(group.output_dir)
                     if str(group.output_dir) not in output_dirs:
                         output_dirs.append(str(group.output_dir))
                     self._Log(LOG_INFO, f"  输出目录：{group.output_dir}")
@@ -122,6 +132,7 @@ class AlbumWorker(QThread):
                         output_path = OutputPathFor(
                             group.audio_dir, group.output_dir, audio_path
                         )
+                        output_path = reserve_output_path(output_path, used_outputs)
                         done += 1
 
                         if output_path.exists() and not overwrite:
@@ -129,87 +140,47 @@ class AlbumWorker(QThread):
                             message = f"已跳过（输出文件已存在）：{output_path.name}"
                             skipped_logs.append(message)
                             self._Log(LOG_WARN, message)
-                            self.progressChanged.emit(
-                                self._thread_id, done, total_files, output_path.name
-                            )
+                            self._Progress(done, total_files, output_path.name)
                             emit_statistics()
                             continue
 
-                        temp_path = output_path.with_name(
-                            f".{output_path.name}.part{output_path.suffix}"
-                        )
-                        try:
-                            temp_path.unlink(missing_ok=True)
-                        except OSError as exc:
-                            failed_count += 1
-                            message = f"{audio_path.name}：无法清理临时文件：{exc}"
-                            error_logs.append(message)
-                            self._Log(LOG_ERROR, message)
-                            self.progressChanged.emit(
-                                self._thread_id, done, total_files, audio_path.name
-                            )
-                            emit_statistics()
-                            continue
-
+                        temp_path = temporary_path_for(output_path)
                         try:
                             cmd = BuildFfmpegCommand(
-                                ffmpeg=self._ffmpeg_path,
-                                audio_path=audio_path,
-                                image_path=task.image_path,
-                                output_path=temp_path,
-                                overwrite=overwrite,
-                                metadata=task.metadata,
+                                ffmpeg=self._ffmpeg_path, audio_path=audio_path,
+                                image_path=task.image_path, output_path=temp_path,
+                                overwrite=overwrite, metadata=task.metadata,
                             )
-                        except Exception as exc:  # noqa: BLE001 —— 与图片模块保持一致
-                            failed_count += 1
-                            message = f"{audio_path.name}：{exc}"
-                            error_logs.append(message)
-                            self._Log(LOG_ERROR, message)
-                            self.progressChanged.emit(
-                                self._thread_id, done, total_files, audio_path.name
-                            )
-                            emit_statistics()
-                            continue
-
-                        return_code, error_tail, was_cancelled = RunFileProcess(
-                            cmd, cancel_check=self._CancelCheck
-                        )
-                        if was_cancelled:
-                            temp_path.unlink(missing_ok=True)
-                            cancelled = True
-                            done -= 1
-                            break
-                        if return_code == 0:
-                            try:
-                                if not overwrite and output_path.exists():
-                                    temp_path.unlink(missing_ok=True)
+                            file_plan = FilePlan(audio_path, output_path, temp_path, tuple(cmd),
+                                                 overwrite=overwrite)
+                            with output_transaction(file_plan):
+                                result = RunFileProcess(file_plan.command, cancel_check=self._CancelCheck)
+                                if result.cancelled or self._cancel_requested:
+                                    cancelled = True
+                                    done -= 1
+                                    break
+                                if not result.succeeded:
+                                    failed_count += 1
+                                    message = f"{audio_path.name} 处理失败：{result.stderr or 'ffmpeg 返回未知错误'}"
+                                    error_logs.append(message)
+                                    self._Log(LOG_ERROR, message)
+                                elif commit_output(file_plan):
+                                    ok_count += 1
+                                    self._Log(LOG_OK, f"{audio_path.name} → {output_path.name} 完成")
+                                else:
                                     skipped_count += 1
                                     message = f"已跳过（输出文件已存在）：{output_path.name}"
                                     skipped_logs.append(message)
                                     self._Log(LOG_WARN, message)
-                                else:
-                                    temp_path.replace(output_path)
-                                    ok_count += 1
-                                    self._Log(LOG_OK, f"{audio_path.name} → {output_path.name} 完成")
-                            except OSError as exc:
-                                temp_path.unlink(missing_ok=True)
-                                failed_count += 1
-                                message = f"{audio_path.name}：无法保存输出文件：{exc}"
-                                error_logs.append(message)
-                                self._Log(LOG_ERROR, message)
-                        else:
-                            temp_path.unlink(missing_ok=True)
+                        except (OSError, ValueError) as exc:
                             failed_count += 1
-                            detail = error_tail or "ffmpeg 返回未知错误"
-                            message = f"{audio_path.name} 处理失败：{detail}"
+                            message = f"{audio_path.name}：{exc}"
                             error_logs.append(message)
                             self._Log(LOG_ERROR, message)
-
-                        self.progressChanged.emit(
-                            self._thread_id, done, total_files, audio_path.name
-                        )
+                        self._Progress(done, total_files, audio_path.name)
                         emit_statistics()
         except Exception as exc:  # noqa: BLE001 —— 保证线程异常时也能汇报并结束
+            failed_count += 1
             message = f"线程内部异常：{exc}"
             error_logs.append(message)
             self._Log(LOG_ERROR, message)
@@ -230,15 +201,15 @@ class AlbumWorker(QThread):
 
         emit_statistics()
 
-        self.taskFinished.emit(self._thread_id, {
-            "total": total_files,
-            "ok": ok_count,
-            "failed": failed_count,
-            "skipped": skipped_count,
-            "skipped_dirs": len(plan.skipped_dirs),
-            "cancelled": cancelled,
-            "early_stopped": early_stopped,
-            "output_dirs": output_dirs,
-            "error_logs": error_logs,
-            "skipped_logs": skipped_logs,
-        })
+        self.taskFinished.emit(self._thread_id, TaskResult(
+            total=total_files,
+            ok=ok_count,
+            failed=failed_count,
+            skipped=skipped_count,
+            skipped_dirs=len(plan.skipped_dirs),
+            cancelled=cancelled,
+            early_stopped=early_stopped,
+            output_dirs=output_dirs,
+            error_logs=error_logs,
+            skipped_logs=skipped_logs,
+        ))
