@@ -30,7 +30,8 @@ from qfluentwidgets import (
 )
 from qfluentwidgets.common.style_sheet import isDarkTheme
 
-from app.AddCover import BuildAlbumPlan, SummarizeAlbumPlan
+from app.audio.album_planner import build_album_plan as BuildAlbumPlan
+from ui.media_presentation import summarize_album_plan as SummarizeAlbumPlan
 from app.audio.models import AlbumPlan
 from ui.AlbumWorker import AlbumWorker
 from ui.Controls import MakeSwitchButton

@@ -46,19 +46,13 @@ from qfluentwidgets.common.style_sheet import isDarkTheme
 
 from app.audio.formats import AUDIO_EXTENSIONS, IMAGE_EXTENSIONS
 from app.audio.models import TrackEdit
-from app.MetadataEdit import (
-    DEFAULT_BITRATE,
-    FORMAT_OPTIONS,
-    METADATA_FIELDS,
-    TEXT_FIELDS,
-    WAV_AUTO_CONVERT_TARGETS,
-    CollectAudioFiles,
-    FieldByKey,
-    FormatByKey,
-    FormatDisplay,
-    LocateFfprobe,
-    MetadataError,
+from app.audio.formats import (
+    DEFAULT_BITRATE, FORMAT_OPTIONS, METADATA_FIELDS, TEXT_FIELDS, WAV_AUTO_CONVERT_TARGETS,
+    field_by_key as FieldByKey, format_by_key as FormatByKey,
 )
+from app.audio.reader import collect_audio_files as CollectAudioFiles, locate_audio_ffprobe as LocateFfprobe
+from app.audio.metadata_planner import MetadataError, apply_cover_edit
+from ui.media_presentation import format_audio_edit
 from ui.Controls import MakeSwitchButton
 from ui.SmoothScroll import SmoothScrollArea as ScrollArea
 from ui.MetadataWorker import CoverExportWorker, MetadataReadWorker, MetadataWriteWorker
@@ -928,7 +922,7 @@ class MetadataPage(QWidget):
         self._FillRow(row_index, row)
 
     def _FillRow(self, row_index: int, row: TrackEdit) -> None:
-        format_cell = _ClickableLabel(row.format_display)
+        format_cell = _ClickableLabel(format_audio_edit(row))
         format_cell.setAlignment(Qt.AlignmentFlag.AlignCenter)
         format_cell.setToolTip("点击修改该文件的格式")
         format_cell.clicked.connect(lambda _checked=False, r=row: self._OnFormatCellClicked(r))
@@ -1153,7 +1147,7 @@ class MetadataPage(QWidget):
                 continue
             cell = self.table.cellWidget(row_index, 0)
             if isinstance(cell, _ClickableLabel):
-                cell.setText(row.format_display)
+                cell.setText(format_audio_edit(row))
         self._UpdateModifiedStatus()
 
     def _OpenCoverDialog(self, scope_row: TrackEdit | None) -> None:
@@ -1183,29 +1177,23 @@ class MetadataPage(QWidget):
         scope_row: TrackEdit | None,
     ) -> None:
         rows = [scope_row] if scope_row is not None else self._rows
+        auto_converted = False
         for row in rows:
             if row.error:
                 continue
-            row.cover_action = action
-            if action == "set":
-                row.cover_source = cover_source
-                if (
-                    row.original_ext == ".wav"
-                    and row.target_format_key is None
-                    and self.wav_cover_switch.isChecked()
-                ):
-                    target_key = self.wav_target_combo.itemData(
-                        self.wav_target_combo.currentIndex()
-                    )
-                    row.target_format_key = target_key
-                    row.bitrate = DEFAULT_BITRATE
-            else:
-                row.cover_source = None
+            updated = apply_cover_edit(
+                row, action, cover_source,
+                auto_convert_wav=self.wav_cover_switch.isChecked(),
+                wav_target_key=self.wav_target_combo.itemData(self.wav_target_combo.currentIndex()),
+            )
+            auto_converted |= row.target_format_key != updated.target_format_key
+            row.cover_action = updated.cover_action
+            row.cover_source = updated.cover_source
+            row.target_format_key = updated.target_format_key
+            row.bitrate = updated.bitrate
             self._UpdateRowCells(row)
         self._UpdateModifiedStatus()
-        if action == "set" and any(
-            row.original_ext == ".wav" for row in rows if row.cover_action == "set"
-        ) and self.wav_cover_switch.isChecked():
+        if auto_converted:
             self._AppendLog(LOG_INFO, "wav 加封面：已自动设置转换格式（写入时转换）")
 
     # ---- 确认写入 -----------------------------------------------------

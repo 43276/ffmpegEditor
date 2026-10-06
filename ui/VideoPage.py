@@ -16,7 +16,8 @@ from qfluentwidgets import (
 from qfluentwidgets.common.style_sheet import isDarkTheme
 
 from app.ffmpeg_environment import FfmpegCapabilities
-from app.VideoCore import BuildVideoBatchesForInputs, SummarizeVideoBatches, VideoInputError
+from app.video.planner import build_video_batches_for_inputs as BuildVideoBatchesForInputs, VideoInputError
+from ui.media_presentation import summarize_video_batches as SummarizeVideoBatches
 from app.video.models import VideoCompressOptions
 from ui.Controls import MakeSwitchButton
 from ui.SmoothScroll import SmoothScrollArea as ScrollArea

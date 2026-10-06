@@ -2,29 +2,29 @@
 from __future__ import annotations
 
 import json
-import subprocess
 import tempfile
 import unittest
 from datetime import datetime
 from pathlib import Path
 from unittest.mock import patch
 
-from app.AddCover import (
-    BuildAlbumPlan, BuildFfmpegCommand, OutputPathFor, TrackMetadata,
-)
-from app.Converter import BuildCommand, ConverterError
+from app.audio.album_planner import build_album_plan as BuildAlbumPlan, output_path_for as OutputPathFor
+from app.audio.album_commands import build_album_command as BuildFfmpegCommand
+from app.audio.models import TrackEdit, TrackMetadata
+from app.audio.metadata_planner import build_output_plan as BuildOutputPlan
+from app.audio.reader import collect_audio_files as CollectAudioFiles, read_audio_info as ReadAudioInfo
+from app.errors import FfmpegError as ConverterError
 from app.ffmpeg_environment import FfmpegCapabilities
-from app.Core import (
-    Batch, BuildBatches, BuildBatchesForInputs, ConvertOptions, InputError,
-    MakeTaskOutputName, RelocateBatchOutputs,
+from app.image.commands import build_image_command as BuildCommand
+from app.image.models import Batch, ConvertOptions
+from app.image.planner import (
+    build_batches as BuildBatches, build_batches_for_inputs as BuildBatchesForInputs,
+    make_task_output_name as MakeTaskOutputName, relocate_batch_outputs as RelocateBatchOutputs, InputError,
 )
-from app.MetadataEdit import (
-    BuildOutputPlan, CollectAudioFiles, ReadAudioInfo, TrackEdit,
-)
-from app.VideoCore import (
-    BuildVideoBatchesForInputs, BuildVideoCompressCommand,
-    VideoCompressOptions, VideoInputError,
-)
+from app.video.commands import build_video_compress_command as BuildVideoCompressCommand
+from app.video.models import VideoCompressOptions
+from app.video.planner import build_video_batches_for_inputs as BuildVideoBatchesForInputs, VideoInputError
+from app.task_models import ProcessResult
 
 
 CAPABILITIES = FfmpegCapabilities(
@@ -110,7 +110,7 @@ class BehaviorTests(unittest.TestCase):
     def test_video_multiple_files_keep_time_suffix_rule(self):
         first = self.sample("a.mp4")
         second = self.sample("b.mkv")
-        with patch("app.VideoCore.MakeTaskOutputName", return_value="2026-10-06_12-30-45"):
+        with patch("app.video.planner.make_task_output_name", return_value="2026-10-06_12-30-45"):
             batch = BuildVideoBatchesForInputs([first, second])[0]
         self.assertEqual(batch.output_dir, self.root / "2026-10-06_12-30-45_output")
         self.assertEqual(BuildVideoBatchesForInputs([first])[0].output_dir,
@@ -118,21 +118,21 @@ class BehaviorTests(unittest.TestCase):
 
     def test_image_animation_and_static_frame_rules(self):
         source = self.root / "animated.gif"
-        webp = BuildCommand(ConvertOptions("ffmpeg", ".webp"), CAPABILITIES, source)
+        webp = BuildCommand(ConvertOptions("ffmpeg", ".webp"), CAPABILITIES, source, self.root / "out.webp")
         self.assertEqual(values_for(webp, "-c:v"), ["libwebp_anim"])
         self.assertNotIn("-frames:v", webp)
         self.assertIn("16383", values_for(webp, "-vf")[0])
-        gif = BuildCommand(ConvertOptions("ffmpeg", ".gif"), CAPABILITIES, source)
+        gif = BuildCommand(ConvertOptions("ffmpeg", ".gif"), CAPABILITIES, source, self.root / "out.gif")
         self.assertNotIn("-frames:v", gif)
         self.assertIn("palettegen", values_for(gif, "-vf")[0])
         self.assertIn("paletteuse", values_for(gif, "-vf")[0])
         self.assertEqual(values_for(gif, "-loop"), ["0"])
-        static = BuildCommand(ConvertOptions("ffmpeg", ".jpg"), CAPABILITIES, source)
+        static = BuildCommand(ConvertOptions("ffmpeg", ".jpg"), CAPABILITIES, source, self.root / "out.jpg")
         self.assertEqual(values_for(static, "-frames:v"), ["1"])
 
     def test_video_command_keeps_only_video_and_optional_audio(self):
         options = VideoCompressOptions("ffmpeg", encoder="libx265", overwrite=False)
-        command = BuildVideoCompressCommand(options, CAPABILITIES, self.root / "video.mkv")
+        command = BuildVideoCompressCommand(options, CAPABILITIES, self.root / "video.mkv", self.root / "out.mp4")
         self.assertEqual(values_for(command, "-map"), ["0:v:0", "0:a?"])
         self.assertEqual(values_for(command, "-tag:v"), ["hvc1"])
         self.assertEqual(values_for(command, "-c:a"), ["aac"])
@@ -140,7 +140,7 @@ class BehaviorTests(unittest.TestCase):
         self.assertIn("-n", command)
         with self.assertRaises(ConverterError):
             BuildVideoCompressCommand(options, FfmpegCapabilities("test", set(), set()),
-                                      self.root / "video.mkv")
+                                      self.root / "video.mkv", self.root / "out.mp4")
 
     def album(self, name, images=1, metadata=True):
         audio = self.sample(f"albums/{name}/disc/song.wav")
@@ -245,14 +245,14 @@ class BehaviorTests(unittest.TestCase):
         data = {"format": {"tags": {"title": "歌曲🎵", "artist": "作者"}},
                 "streams": [{"codec_type": "video", "codec_name": "mjpeg",
                              "disposition": {"attached_pic": 1}}]}
-        process = subprocess.CompletedProcess([], 0, json.dumps(data, ensure_ascii=False), "")
-        with patch("app.MetadataEdit.subprocess.run", return_value=process) as run:
+        process = ProcessResult(0, stdout=json.dumps(data, ensure_ascii=False).encode("utf-8"))
+        with patch("app.converter.execute", return_value=process) as run:
             info = ReadAudioInfo("ffprobe", source)
         self.assertEqual(info.values["title"], "歌曲🎵")
         self.assertTrue(info.has_cover)
         self.assertEqual(info.cover_codec, "mjpeg")
-        self.assertEqual(run.call_args.kwargs["encoding"], "utf-8")
-        self.assertEqual(run.call_args.kwargs["errors"], "replace")
+        self.assertTrue(run.call_args.kwargs["capture_stdout"])
+        self.assertEqual(run.call_args.kwargs["timeout_seconds"], 60)
 
 
 if __name__ == "__main__":

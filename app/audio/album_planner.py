@@ -1,14 +1,20 @@
+"""专辑扫描、文本读取与输出规划；不创建输出文件。"""
 from __future__ import annotations
 
-from .audio.formats import AUDIO_EXTENSIONS, IMAGE_EXTENSIONS
-from .audio.models import AlbumAudioGroup, AlbumPlan, AlbumSkippedDir, AlbumTask, TrackMetadata
 from pathlib import Path
+
+from .formats import AUDIO_EXTENSIONS, IMAGE_EXTENSIONS
+from .models import AlbumAudioGroup, AlbumPlan, AlbumSkippedDir, AlbumTask, TrackMetadata
+from .album_commands import build_album_command
+from app.output_files import path_key, reserve_output_path, temporary_path_for
+from app.task_models import BatchPlan, FilePlan, LogEvent, LogLevel, TaskPlan
+
 
 class AlbumCoverError(Exception):
     """专辑封面处理相关的可预期错误，消息可直接展示给用户。"""
 
 
-def ReadTextValue(path: Path) -> str:
+def read_text_value(path: Path) -> str:
     """读取单行文本文件（album.txt 等），缺失或为空时抛出异常。"""
     if not path.is_file():
         raise FileNotFoundError(f"缺少文件: {path}")
@@ -19,7 +25,7 @@ def ReadTextValue(path: Path) -> str:
     return value
 
 
-def ReadArtistValue(path: Path) -> str:
+def read_artist_value(path: Path) -> str:
     """读取 artist.txt，多个艺术家用空白分隔，写入时转为分号分隔。"""
     if not path.is_file():
         raise FileNotFoundError(f"缺少文件: {path}")
@@ -29,99 +35,30 @@ def ReadArtistValue(path: Path) -> str:
     return ";".join(artists)
 
 
-def ReadMetadataNearImage(image_path: Path) -> TrackMetadata:
+def read_metadata_near_image(image_path: Path) -> TrackMetadata:
     """从封面图片所在目录读取 album.txt 与 artist.txt。"""
     metadata_dir = image_path.parent
     return TrackMetadata(
-        album=ReadTextValue(metadata_dir / "album.txt"),
-        artist=ReadArtistValue(metadata_dir / "artist.txt"),
+        album=read_text_value(metadata_dir / "album.txt"),
+        artist=read_artist_value(metadata_dir / "artist.txt"),
     )
 
-
-def ImageCodecFor(image_path: Path) -> str:
-    if image_path.suffix.lower() in {".jpg", ".jpeg"}:
-        return "mjpeg"
-    return "png"
-
-
-def IsAudioFile(path: Path) -> bool:
+def is_album_audio_file(path: Path) -> bool:
     return path.is_file() and path.suffix.lower() in AUDIO_EXTENSIONS
 
 
-def IsImageFile(path: Path) -> bool:
+def is_album_image_file(path: Path) -> bool:
     return path.is_file() and path.suffix.lower() in IMAGE_EXTENSIONS
 
 
-def OutputPathFor(audio_dir: Path, output_dir: Path, audio_path: Path) -> Path:
+def output_path_for(audio_dir: Path, output_dir: Path, audio_path: Path) -> Path:
     """输出路径：相对音频目录的结构平移到输出目录；.wav 转为 .mp3。"""
     relative_path = audio_path.relative_to(audio_dir)
     if audio_path.suffix.lower() == ".wav":
         relative_path = relative_path.with_suffix(".mp3")
     return output_dir / relative_path
 
-
-def BuildFfmpegCommand(
-    ffmpeg: str,
-    audio_path: Path,
-    image_path: Path,
-    output_path: Path,
-    overwrite: bool,
-    metadata: TrackMetadata,
-) -> list[str]:
-    """为单个音频构建嵌入封面并写元数据的 ffmpeg 命令。"""
-    ext = audio_path.suffix.lower()
-    cover_codec = "mjpeg" if ext in {".mp3", ".wav"} else ImageCodecFor(image_path)
-    command = [
-        ffmpeg,
-        "-hide_banner",
-        "-loglevel",
-        "error",
-        "-y" if overwrite else "-n",
-        "-i",
-        str(audio_path),
-        "-i",
-        str(image_path),
-        "-map",
-        "0:a?",
-        "-map",
-        "1:v:0",
-        "-map_metadata",
-        "0",
-        "-metadata",
-        f"album={metadata.album}",
-        "-metadata",
-        f"artist={metadata.artist}",
-        "-metadata",
-        "title=",
-        "-metadata",
-        "#=",
-        "-c:v",
-        cover_codec,
-        "-metadata:s:v",
-        "title=Album cover",
-        "-metadata:s:v",
-        "comment=Cover (front)",
-    ]
-
-    if ext == ".wav":
-        command.extend([
-            "-c:a", "libmp3lame", "-q:a", "2", "-id3v2_version", "3",
-            "-disposition:v:0", "attached_pic",
-        ])
-    elif ext == ".mp3":
-        # MP3 中的图片流必须标记为 attached_pic，播放器才会将其识别为封面。
-        command.extend([
-            "-c:a", "copy", "-id3v2_version", "3",
-            "-disposition:v:0", "attached_pic",
-        ])
-    else:
-        command.extend(["-c:a", "copy", "-disposition:v:0", "attached_pic"])
-
-    command.append(str(output_path))
-    return command
-
-
-def IsInGeneratedOutput(path: Path, processing_dir: Path) -> bool:
+def is_in_generated_output(path: Path, processing_dir: Path) -> bool:
     """判断路径是否位于专辑内已生成的 `<专辑名>` 输出目录中。"""
     for parent in path.parents:
         if parent == processing_dir:
@@ -131,28 +68,28 @@ def IsInGeneratedOutput(path: Path, processing_dir: Path) -> bool:
     return False
 
 
-def CollectRecursiveAudioFiles(processing_dir: Path) -> list[Path]:
+def collect_recursive_audio_files(processing_dir: Path) -> list[Path]:
     return sorted(
         path
         for path in processing_dir.rglob("*")
-        if IsAudioFile(path) and not IsInGeneratedOutput(path, processing_dir)
+        if is_album_audio_file(path) and not is_in_generated_output(path, processing_dir)
     )
 
 
-def CollectRecursiveImageFiles(processing_dir: Path) -> list[Path]:
+def collect_recursive_image_files(processing_dir: Path) -> list[Path]:
     return sorted(
         path
         for path in processing_dir.rglob("*")
-        if IsImageFile(path) and not IsInGeneratedOutput(path, processing_dir)
+        if is_album_image_file(path) and not is_in_generated_output(path, processing_dir)
     )
 
 
-def FindProcessingDirs(root_dir: Path) -> list[Path]:
+def find_processing_dirs(root_dir: Path) -> list[Path]:
     """根目录下的每个一级子文件夹视为一张待处理的专辑。"""
     return sorted(path for path in root_dir.iterdir() if path.is_dir())
 
 
-def GroupAudioByParent(audio_files: list[Path]) -> dict[Path, list[Path]]:
+def group_audio_by_parent(audio_files: list[Path]) -> dict[Path, list[Path]]:
     """把音频按实际所在目录分组，输出目录由各组自己维护。"""
     grouped: dict[Path, list[Path]] = {}
     for audio_file in audio_files:
@@ -160,7 +97,7 @@ def GroupAudioByParent(audio_files: list[Path]) -> dict[Path, list[Path]]:
     return dict(sorted(grouped.items()))
 
 
-def BuildAlbumPlan(root_dir: str | Path) -> AlbumPlan:
+def build_album_plan(root_dir: str | Path) -> AlbumPlan:
     """扫描根目录，产出专辑批处理计划。"""
     root = Path(root_dir)
     if not root.exists():
@@ -168,13 +105,13 @@ def BuildAlbumPlan(root_dir: str | Path) -> AlbumPlan:
     if not root.is_dir():
         raise NotADirectoryError(f"不是文件夹: {root}")
 
-    processing_dirs = FindProcessingDirs(root)
+    processing_dirs = find_processing_dirs(root)
     tasks: list[AlbumTask] = []
     skipped_dirs: list[AlbumSkippedDir] = []
 
     for processing_dir in processing_dirs:
-        audio_files = CollectRecursiveAudioFiles(processing_dir)
-        image_files = CollectRecursiveImageFiles(processing_dir)
+        audio_files = collect_recursive_audio_files(processing_dir)
+        image_files = collect_recursive_image_files(processing_dir)
 
         if not audio_files:
             skipped_dirs.append(AlbumSkippedDir(processing_dir, "没有找到音频文件"))
@@ -193,7 +130,7 @@ def BuildAlbumPlan(root_dir: str | Path) -> AlbumPlan:
 
         image_path = image_files[0]
         try:
-            metadata = ReadMetadataNearImage(image_path)
+            metadata = read_metadata_near_image(image_path)
         except (FileNotFoundError, ValueError) as error:
             skipped_dirs.append(AlbumSkippedDir(processing_dir, str(error)))
             continue
@@ -204,7 +141,7 @@ def BuildAlbumPlan(root_dir: str | Path) -> AlbumPlan:
                 output_dir=audio_dir / processing_dir.name,
                 files=files,
             )
-            for audio_dir, files in GroupAudioByParent(audio_files).items()
+            for audio_dir, files in group_audio_by_parent(audio_files).items()
         ]
         tasks.append(
             AlbumTask(
@@ -218,18 +155,30 @@ def BuildAlbumPlan(root_dir: str | Path) -> AlbumPlan:
     return AlbumPlan(tasks=tasks, skipped_dirs=skipped_dirs)
 
 
-def SummarizeAlbumPlan(plan: AlbumPlan) -> str:
-    """生成供界面预览的摘要文本。"""
-    total_files = plan.file_count
-    skipped_count = len(plan.skipped_dirs)
-
-    if not plan.tasks:
-        if not plan.skipped_dirs:
-            return "根目录下没有找到待处理的一级子文件夹"
-        return f"未发现可处理专辑：{skipped_count} 个文件夹将被跳过"
-
-    text = f"发现 {len(plan.tasks)} 张专辑、共 {total_files} 个音频"
-    if skipped_count:
-        text += f"，另有 {skipped_count} 个文件夹将被跳过"
-    first_output = plan.tasks[0].groups[0].output_dir
-    return text + f"（首个输出目录：{first_output}）"
+def build_album_task(plan: AlbumPlan, ffmpeg_path: str, overwrite: bool) -> TaskPlan:
+    taken = {path_key(source) for task in plan.tasks for group in task.groups for source in group.files}
+    batches: list[BatchPlan] = []
+    for task in plan.tasks:
+        files: list[FilePlan] = []
+        for group in task.groups:
+            for source in group.files:
+                destination = reserve_output_path(
+                    output_path_for(group.audio_dir, group.output_dir, source), taken,
+                )
+                temporary = temporary_path_for(destination)
+                command = build_album_command(
+                    ffmpeg_path, source, task.image_path, temporary, overwrite, task.metadata,
+                )
+                files.append(FilePlan(source, destination, temporary, tuple(command), overwrite=overwrite))
+        # 一张专辑的所有目录属于同一批次，结束请求不能在目录之间截断。
+        batches.append(BatchPlan(
+            task.processing_dir.name, tuple(files),
+            (LogEvent(LogLevel.INFO, f"专辑 {task.processing_dir.name}：{task.file_count} 个音频，"
+                      f"封面 {task.image_path.name}"),),
+        ))
+    return TaskPlan(
+        tuple(batches),
+        tuple(LogEvent(LogLevel.WARN, f"[跳过文件夹] {item.processing_dir.name}：{item.reason}")
+              for item in plan.skipped_dirs),
+        skipped_dirs=len(plan.skipped_dirs),
+    )

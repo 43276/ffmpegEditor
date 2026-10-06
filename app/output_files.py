@@ -50,9 +50,17 @@ def ensure_output_directory(directory: Path) -> None:
 def _validate_paths(plan: FilePlan) -> None:
     source = path_key(plan.source_path)
     output = path_key(plan.output_path)
-    temporary = path_key(plan.temp_path)
-    if temporary in {source, output} or plan.temp_path.parent.resolve() != plan.output_path.parent.resolve():
-        raise ValueError("临时文件必须在输出目录内，且不能是源文件或正式输出")
+    temporary_keys: set[str] = set()
+    for temporary in (plan.temp_path, *plan.auxiliary_paths):
+        key = path_key(temporary)
+        if key in {source, output} or temporary.parent.resolve() != plan.output_path.parent.resolve():
+            raise ValueError("临时文件必须在输出目录内，且不能是源文件或正式输出")
+        if key in temporary_keys:
+            raise ValueError("临时文件路径不能重复")
+        temporary_keys.add(key)
+    for step in plan.preparation_steps:
+        if step.output_path is not None and path_key(step.output_path) not in temporary_keys:
+            raise ValueError("准备步骤只能写入计划声明的临时文件")
     if (source == output) != plan.replaces_source:
         raise ValueError("源文件替换策略与输出路径不一致")
 
@@ -61,13 +69,15 @@ def prepare_output(plan: FilePlan) -> None:
     _validate_paths(plan)
     ensure_output_directory(plan.output_path.parent)
     # 不删除另一任务的文件，也不预建空文件影响 FFmpeg 的 -n 行为。
-    if plan.temp_path.exists():
-        raise FileExistsError(f"临时路径已被占用：{plan.temp_path}")
+    for temporary in (plan.temp_path, *plan.auxiliary_paths):
+        if temporary.exists():
+            raise FileExistsError(f"临时路径已被占用：{temporary}")
 
 
 def cleanup_output(plan: FilePlan) -> None:
     _validate_paths(plan)
-    plan.temp_path.unlink(missing_ok=True)
+    for temporary in (plan.temp_path, *plan.auxiliary_paths):
+        temporary.unlink(missing_ok=True)
 
 
 def _backup_source(source: Path) -> None:

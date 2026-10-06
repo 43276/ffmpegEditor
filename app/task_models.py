@@ -25,6 +25,9 @@ class ProcessStep:
     command: tuple[str, ...]
     timeout_seconds: float = 900.0
     capture_stdout: bool = False
+    output_path: Path | None = None
+    failure_warning: str | None = None
+    fallback_command: tuple[str, ...] | None = None
 
 
 @dataclass(frozen=True)
@@ -39,10 +42,15 @@ class FilePlan:
     converted: bool = False
     warnings: tuple[str, ...] = ()
     preparation_steps: tuple[ProcessStep, ...] = ()
+    auxiliary_paths: tuple[Path, ...] = ()
+    timeout_seconds: float = 900.0
+    error: str | None = None
+    skip_reason: str | None = None
+    success_message: str = ""
 
     @property
     def steps(self) -> tuple[ProcessStep, ...]:
-        return (*self.preparation_steps, ProcessStep(self.command))
+        return (*self.preparation_steps, ProcessStep(self.command, self.timeout_seconds))
 
 
 @dataclass(frozen=True)
@@ -51,6 +59,7 @@ class BatchPlan:
 
     name: str
     files: tuple[FilePlan, ...]
+    log_events: tuple[LogEvent, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -64,6 +73,27 @@ class TaskProgress:
 class LogEvent:
     level: LogLevel
     message: str
+
+
+@dataclass(frozen=True)
+class TaskPlan:
+    batches: tuple[BatchPlan, ...]
+    log_events: tuple[LogEvent, ...] = ()
+    skipped_dirs: int = 0
+    output_dirs: tuple[Path, ...] = ()
+
+    @property
+    def total(self) -> int:
+        return sum(len(batch.files) for batch in self.batches)
+
+
+@dataclass(frozen=True)
+class TaskStatistics:
+    total: int
+    ok: int
+    failed: int
+    skipped: int
+    done: int
 
 
 @dataclass(frozen=True)

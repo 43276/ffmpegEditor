@@ -6,13 +6,6 @@ from pathlib import Path
 
 
 @dataclass(frozen=True)
-class CoverExportResult:
-    path: Path | None = None
-    error: str | None = None
-    cancelled: bool = False
-
-
-@dataclass(frozen=True)
 class MetadataField:
     key: str
     display_name: str
@@ -39,6 +32,7 @@ class AudioInfo:
     has_cover: bool
     cover_codec: str | None
     error: str | None = None
+    cancelled: bool = False
 
     @property
     def file_name(self) -> str:
@@ -87,14 +81,6 @@ class TrackEdit:
         return bool(self.edited_values) or self.cover_action is not None or (
             self.target_format_key is not None
         )
-
-    @property
-    def format_display(self) -> str:
-        from .formats import format_display
-
-        return format_display(self.original_ext, self.target_format_key, self.bitrate)
-
-
 @dataclass(frozen=True)
 class TrackMetadata:
     album: str

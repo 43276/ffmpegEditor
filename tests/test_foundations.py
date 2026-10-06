@@ -11,15 +11,17 @@ from dataclasses import replace
 from pathlib import Path
 from unittest.mock import patch
 
-from app.Converter import RunFileProcess
+from app.converter import execute as RunFileProcess
 from app.errors import FfmpegError
 from app.ffmpeg_environment import locate_ffmpeg, locate_ffprobe, probe_ffmpeg
-from app.MetadataEdit import BuildOutputPlan, ExtractCoverToFile
+from app.audio.metadata_planner import build_output_plan as BuildOutputPlan
+from app.audio.cover_planner import build_cover_export_plan
+from app.task_runner import TaskRunner
 from app.audio.models import TrackEdit
 from app.output_files import (
     commit_output, output_transaction, path_key, reserve_output_path, temporary_path_for,
 )
-from app.task_models import FilePlan, ProcessResult
+from app.task_models import BatchPlan, FilePlan, ProcessResult, TaskPlan
 
 
 class FoundationTests(unittest.TestCase):
@@ -93,7 +95,7 @@ class FoundationTests(unittest.TestCase):
         failed = RunFileProcess([str(self.root / "missing.exe")])
         self.assertFalse(failed.succeeded)
         self.assertIn("无法启动", failed.stderr)
-        with patch("app.Converter.subprocess.Popen") as popen:
+        with patch("app.converter.subprocess.Popen") as popen:
             cancelled = RunFileProcess(["unused"], cancel_check=lambda: True)
             popen.assert_not_called()
         self.assertTrue(cancelled.cancelled)
@@ -213,10 +215,10 @@ class FoundationTests(unittest.TestCase):
             Path(command[-1]).write_bytes(b"partial cover")
             return ProcessResult(1, "bad cover")
 
-        with patch("app.MetadataEdit.RunFileProcess", side_effect=fail):
-            result = ExtractCoverToFile("ffmpeg", self.source, self.root, "mjpeg")
-        self.assertEqual(result.error, "bad cover")
-        self.assertIsNone(result.path)
+        plan = build_cover_export_plan("ffmpeg", self.source, self.root, "mjpeg")
+        result = TaskRunner(execute=fail).run(TaskPlan((BatchPlan("cover", (plan,)),)))
+        self.assertEqual(result.failed, 1)
+        self.assertIn("bad cover", result.error_logs[0])
         self.assertEqual(cover.read_bytes(), b"existing cover")
         self.assertFalse((self.root / "source (1).jpg").exists())
         self.assertFalse(list(self.root.rglob("*.part.*")))

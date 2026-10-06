@@ -86,15 +86,3 @@ def format_by_key(key: str | None) -> AudioFormatOption | None:
     if key is None:
         return None
     return _FORMATS_BY_KEY.get(key)
-
-
-def format_display(original_ext: str, target_format_key: str | None, bitrate: str | None) -> str:
-    """格式列显示文本：无转换为 .mp3；有转换为 .mp3->.m4a 192k（无损无码率）。"""
-    source_ext = original_ext.lower()
-    target = format_by_key(target_format_key)
-    if target is None or target.key == "keep":
-        return source_ext
-    text = f"{source_ext}->{target.extension}"
-    if target.lossy:
-        text += f" {bitrate or DEFAULT_BITRATE}"
-    return text

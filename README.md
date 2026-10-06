@@ -146,24 +146,35 @@ D:\Music\Root\A\Disc2\A\song2.mp3
 ffmpegEditor/
 ├── main.py              # 入口
 ├── app/
-│   ├── task_models.py   # 公共文件 / 批次 / 步骤计划、事件与结果
+│   ├── converter.py     # 仅执行完整命令，处理取消、超时和输出收集
+│   ├── task_models.py   # 公共任务 / 批次 / 文件 / 步骤计划、事件与结果
+│   ├── task_runner.py   # 顺序执行、停止控制、进度统计与保存
 │   ├── ffmpeg_environment.py # ffmpeg / ffprobe 定位与能力快照
 │   ├── output_files.py  # 名字占用、临时文件、备份、保存与清理
+│   ├── input_paths.py   # 图片 / 视频共用的叶子目录遍历
 │   ├── errors.py        # 公共 FFmpeg 错误
 │   ├── image/
 │   │   ├── models.py    # 图片参数与输入批次
-│   │   └── commands.py  # 图片编码器选择策略
-│   ├── video/models.py  # 视频参数与输入批次
-│   ├── audio/
-│   │   ├── models.py    # 音频快照、编辑草稿、专辑计划与导出结果
-│   │   └── formats.py   # 音频字段与格式规则
-│   ├── Core.py          # 图片 A/B/C 目录规则与批次构建
-│   ├── Converter.py     # 进程执行、后续迁移的图片命令构建
-│   ├── AddCover.py      # 专辑封面 / 元数据批处理核心逻辑
-│   ├── MetadataEdit.py  # 音频元数据编辑 / 格式转换 / 封面提取核心逻辑
-│   └── VideoCore.py     # 视频 A/B/C 目录规则与压缩命令构建
+│   │   ├── formats.py   # 支持格式、动画与无损规则
+│   │   ├── planner.py   # A/B/C 输入、输出命名与完整任务规划
+│   │   └── commands.py  # 完整图片命令、编码器与质量策略
+│   ├── video/
+│   │   ├── models.py    # 视频参数与输入批次
+│   │   ├── planner.py   # 视频输入与 MP4 输出规划
+│   │   └── commands.py  # 完整 H.264 / H.265 压缩命令
+│   └── audio/
+│       ├── models.py    # 音频快照、编辑草稿与专辑模型
+│       ├── formats.py   # 音频字段、格式与容器规则
+│       ├── reader.py    # 输入收集、ffprobe 与缩略图读取
+│       ├── album_planner.py    # 专辑扫描、文本读取与输出规划
+│       ├── album_commands.py   # 专辑封面与标签命令
+│       ├── metadata_planner.py # 编辑规则、输出与多步计划
+│       ├── metadata_commands.py # 元数据与格式转换命令
+│       ├── cover_planner.py    # 封面导出命名与批次占用
+│       └── cover_commands.py   # 缩略图、导出与原封面提取命令
 └── ui/
     ├── MainWindow.py    # 主窗口、侧栏及跨页面资源协调
+    ├── media_presentation.py # 预览摘要、图片下拉项与音频格式显示
     ├── ImagePage.py     # 图片处理页面
     ├── SettingsPage.py  # FFmpeg 路径与自定义背景设置
     ├── FfmpegService.py # 共享 FFmpeg 配置与异步能力检测
@@ -191,7 +202,9 @@ ffmpegEditor/
 
 新增基线覆盖 A/B/C 与同级多选、输出命名、图片动画与视频流映射、音频标签与封面。公共边界检查覆盖检测失败与超时、二进制输出、取消清理、提交时的覆盖保护、备份失败和四类 Worker 的同名输出。
 
-当前已完成重构第一阶段：公共模型与文件管理已接入现有 Worker，页面消费 `TaskResult`，日志级别统一来自应用层。输入解析和完整业务命令的拆分、TaskRunner 与 UI 线程管理按后续任务继续迁移。
+第二阶段检查覆盖无 Qt 环境下导入业务模块、规划时不写文件、完整命令、整张专辑的结束边界、WAV 封面编辑、原封面提取失败后的备用命令、步骤间取消及辅助临时文件清理。当前共 68 项自动检查。
+
+当前已完成重构第一、二阶段（任务 01–12）：各业务包生成完整 `TaskPlan`，规划阶段只读取文件；`converter.execute()` 只执行命令，`TaskRunner` 按计划处理停止、进度、统计和输出保存。原封面的提取属于准备步骤，失败时按计划记录警告并执行不带封面的备用写入命令，所有临时文件统一清理。现有 Worker 负责 Qt 线程与信号适配，页面消费 `TaskResult`；后续继续统一 UI 任务管理和线程生命周期。
 
 ## 备注
 

@@ -40,14 +40,12 @@ from qfluentwidgets.common.style_sheet import isDarkTheme
 
 from app.ffmpeg_environment import FfmpegCapabilities
 from app.image.commands import supports_image_format
-from app.Core import (
-    BuildBatchesForInputs,
-    InputError,
-    IsLosslessExtension,
-    SummarizeBatches,
-    TARGET_FORMAT_OPTIONS,
-    MakeTaskOutputName,
+from app.image.planner import (
+    build_batches_for_inputs as BuildBatchesForInputs, InputError,
+    make_task_output_name as MakeTaskOutputName,
 )
+from app.image.formats import is_lossless_extension as IsLosslessExtension
+from ui.media_presentation import summarize_image_batches as SummarizeBatches, TARGET_FORMAT_OPTIONS
 from app.image.models import ConvertOptions
 from ui.Controls import MakeSwitchButton
 from ui.SmoothScroll import SmoothScrollArea as ScrollArea

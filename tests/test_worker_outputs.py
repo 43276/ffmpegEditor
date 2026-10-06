@@ -11,7 +11,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PyQt6.QtWidgets import QApplication
 
-from app.AddCover import BuildAlbumPlan
+from app.audio.album_planner import build_album_plan as BuildAlbumPlan
 from app.audio.models import AudioInfo, TrackEdit
 from app.ffmpeg_environment import FfmpegCapabilities
 from app.image.models import Batch, ConvertOptions
@@ -83,10 +83,10 @@ class WorkerOutputTests(unittest.TestCase):
         return MetadataWriteWorker(1, "ffmpeg", edits, True, False, str(output)), output
 
     def test_same_batch_image_video_album_and_metadata_outputs_do_not_overwrite_each_other(self):
-        cases = [(self.image_worker, "ui.Worker.RunFileProcess", ".webp", [b"jpg", b"png"]),
-                 (self.video_worker, "ui.VideoWorker.RunFileProcess", ".mp4", [b"mkv", b"mov"]),
-                 (self.album_worker, "ui.AlbumWorker.RunFileProcess", ".mp3", [b"mp3", b"wav"]),
-                 (self.metadata_worker, "ui.MetadataWorker.RunFileProcess", ".mp3", [b"A", b"B"])]
+        cases = [(self.image_worker, "app.converter.execute", ".webp", [b"jpg", b"png"]),
+                 (self.video_worker, "app.converter.execute", ".mp4", [b"mkv", b"mov"]),
+                 (self.album_worker, "app.converter.execute", ".mp3", [b"mp3", b"wav"]),
+                 (self.metadata_worker, "app.converter.execute", ".mp3", [b"A", b"B"])]
         for factory, target, suffix, originals in cases:
             with self.subTest(factory=factory.__name__):
                 worker, output = factory()
@@ -100,10 +100,10 @@ class WorkerOutputTests(unittest.TestCase):
                 self.assertTrue(all(path.read_bytes() == data for path, data in originals_on_disk.items()))
 
     def test_unexpected_execution_failure_cleans_each_worker_and_reports_failure(self):
-        cases = [(self.image_worker, "ui.Worker.RunFileProcess"),
-                 (self.video_worker, "ui.VideoWorker.RunFileProcess"),
-                 (self.album_worker, "ui.AlbumWorker.RunFileProcess"),
-                 (self.metadata_worker, "ui.MetadataWorker.RunFileProcess")]
+        cases = [(self.image_worker, "app.converter.execute"),
+                 (self.video_worker, "app.converter.execute"),
+                 (self.album_worker, "app.converter.execute"),
+                 (self.metadata_worker, "app.converter.execute")]
         for factory, target in cases:
             with self.subTest(factory=factory.__name__):
                 worker, output = factory()
@@ -118,10 +118,10 @@ class WorkerOutputTests(unittest.TestCase):
                 self.assertFalse(list(output.glob("*")))
 
     def test_cancelling_after_process_returns_cleans_each_worker_without_saving(self):
-        cases = [(self.image_worker, "ui.Worker.RunFileProcess"),
-                 (self.video_worker, "ui.VideoWorker.RunFileProcess"),
-                 (self.album_worker, "ui.AlbumWorker.RunFileProcess"),
-                 (self.metadata_worker, "ui.MetadataWorker.RunFileProcess")]
+        cases = [(self.image_worker, "app.converter.execute"),
+                 (self.video_worker, "app.converter.execute"),
+                 (self.album_worker, "app.converter.execute"),
+                 (self.metadata_worker, "app.converter.execute")]
         for factory, target in cases:
             with self.subTest(factory=factory.__name__):
                 worker, output = factory()
@@ -146,7 +146,7 @@ class WorkerOutputTests(unittest.TestCase):
             destination.write_bytes(b"created by another task")
             return ProcessResult(0)
 
-        result = self.run_worker(worker, "ui.VideoWorker.RunFileProcess", conflict)
+        result = self.run_worker(worker, "app.converter.execute", conflict)
         self.assertEqual((result.ok, result.skipped, result.failed), (0, 2, 0))
         self.assertTrue(all(path.read_bytes() == b"created by another task" for path in output.iterdir()))
 
@@ -154,7 +154,7 @@ class WorkerOutputTests(unittest.TestCase):
         source = self.sample("track.mp3")
         worker = MetadataWriteWorker(1, "ffmpeg", [TrackEdit(source, edited_values={"title": "new"}, backup=True)], True, True, None)
         with patch("app.output_files.shutil.copy2", side_effect=OSError("backup failed")):
-            result = self.run_worker(worker, "ui.MetadataWorker.RunFileProcess")
+            result = self.run_worker(worker, "app.converter.execute")
         self.assertEqual((result.ok, result.failed), (0, 1))
         self.assertTrue(any("backup failed" in message for message in result.error_logs))
         self.assertEqual(source.read_bytes(), b"original")
@@ -165,12 +165,12 @@ class WorkerOutputTests(unittest.TestCase):
         worker = MetadataReadWorker(1, "ffprobe", "ffmpeg", [source])
         worker.rowLoaded.connect(lambda _id, edit: rows.append(edit))
         worker.taskFinished.connect(lambda _id, result: read_results.append(result))
-        with patch("ui.MetadataWorker.ReadAudioInfo", return_value=AudioInfo(source, {"title": "曲目😀"}, False, None)):
+        with patch("app.audio.reader.read_audio_info", return_value=AudioInfo(source, {"title": "曲目😀"}, False, None)):
             worker.run()
         self.assertIsInstance(read_results[0], TaskResult)
         self.assertEqual(rows[0].original_values["title"], "曲目😀")
         export = CoverExportWorker(1, "ffmpeg", [(source, "mjpeg"), (source, None)], str(self.root / "covers"))
-        result = self.run_worker(export, "app.MetadataEdit.RunFileProcess")
+        result = self.run_worker(export, "app.converter.execute")
         self.assertEqual((result.ok, result.skipped), (1, 1))
         self.assertEqual(result.output_dir, str(self.root / "covers"))
 

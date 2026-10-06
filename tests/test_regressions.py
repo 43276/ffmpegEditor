@@ -18,7 +18,7 @@ from PyQt6.QtWidgets import QApplication, QLabel, QVBoxLayout, QWidget
 
 from app.ffmpeg_environment import FfmpegCapabilities
 from app.task_models import ProcessResult
-from app.VideoCore import VideoBatch, VideoCompressOptions
+from app.video.models import VideoBatch, VideoCompressOptions
 from ui.FfmpegService import FfmpegService
 from ui.SmoothScroll import SmoothScrollArea
 from ui.VideoPage import VideoPage
@@ -99,7 +99,7 @@ class RegressionTests(unittest.TestCase):
         page._SetInputs([source])
         summaries = []
 
-        def process(command, cancel_check):
+        def process(command, cancel_check, **kwargs):
             partial = Path(command[-1])
             partial.write_bytes(b"partial video")
             entered.set()
@@ -109,7 +109,7 @@ class RegressionTests(unittest.TestCase):
             return ProcessResult(-1, cancelled=cancel_check())
 
         try:
-            with patch("ui.VideoWorker.RunFileProcess", side_effect=process), patch.object(page, "_ShowInfo"):
+            with patch("app.converter.execute", side_effect=process), patch.object(page, "_ShowInfo"):
                 page._Start()
                 page._worker.taskFinished.connect(summaries.append)
                 WaitUntil(entered.is_set)
@@ -121,11 +121,11 @@ class RegressionTests(unittest.TestCase):
                 self.assertFalse(list(self.root.rglob("*.part.mp4")))
                 self.assertEqual(source.read_bytes(), b"original video")
 
-            def success(command, cancel_check):
+            def success(command, cancel_check, **kwargs):
                 Path(command[-1]).write_bytes(b"compressed video")
                 return ProcessResult(0)
 
-            with patch("ui.VideoWorker.RunFileProcess", side_effect=success), patch.object(page, "_ShowInfo"):
+            with patch("app.converter.execute", side_effect=success), patch.object(page, "_ShowInfo"):
                 page._Start()
                 self.assertIn("正在压缩", page.status.text())
                 WaitUntil(lambda: page._worker is None)
@@ -149,14 +149,14 @@ class RegressionTests(unittest.TestCase):
         calls, summaries = [], []
         worker.taskFinished.connect(summaries.append)
 
-        def process(command, cancel_check):
+        def process(command, cancel_check, **kwargs):
             calls.append(command)
             Path(command[-1]).write_bytes(b"compressed")
             worker.RequestFinishAfterCurrentBatch()
             return ProcessResult(0)
 
         try:
-            with patch("ui.VideoWorker.RunFileProcess", side_effect=process):
+            with patch("app.converter.execute", side_effect=process):
                 worker.start()
                 WaitUntil(lambda: bool(summaries))
                 worker.wait()
